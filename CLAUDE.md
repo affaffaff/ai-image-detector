@@ -61,14 +61,34 @@ brief before any significant design change; never commit anything from `notes/`.
 
 ## Commands
 
-- Build: `npm run build` *(TBD until the MV3 skeleton lands)*
-- Eval: `npm run eval -- --set <path>` *(TBD)*
+- Build: `npm run build` — deterministic `dist/`; CI proves it by building twice
+  and diffing hashes. Load via `chrome://extensions` → Load unpacked → `dist/`.
+- Test: `npm test` (node:test — no directory argument; the Windows runner
+  mishandles directory paths)
+- Typecheck: `npm run typecheck` (tsc `--checkJs` strict, `noUncheckedIndexedAccess`)
+- Eval: `npm run eval -- --set <path>` *(TBD — lands with the benchmark replica)*
+- Python tools env: `py -m venv .venv && .venv/Scripts/pip install -r tools/requirements.txt`
 - Fit calibration:
   `python tools/fit_calibration.py --scores S.npy --labels L.npy --eval-scores ES.npy --eval-labels EL.npy --id <signal> --out models/calibration/<signal>.json`
+- Calibration smoke test: `python tools/test_fit_calibration_smoke.py`
 
 ## Layout notes
 
 - `src/fusion/` — calibration + log-odds fusion. Implemented and test-first.
-- `tools/` — offline fitting scripts (Python, CPU, seconds).
-- `models/manifest.json` — pinned weight URLs + SHA-256 *(TBD)*.
-- `notes/` — PRIVATE, gitignored: briefs, strategy, eval data.
+- `src/background/` `src/content/` `src/offscreen/` `src/popup/` `src/shared/` —
+  MV3 skeleton: SW router, scanner + badges, offscreen inference host +
+  weight download, popup, message protocol. Architecture diagram in README.
+- `test/` — node:test suites (fusion core is fully covered; keep it that way).
+- `tools/` — build (`build.mjs`), icon generator, offline fitting scripts.
+- `models/manifest.json` — pinned weight URLs + SHA-256 *(placeholder until the
+  bake-off pins a checkpoint; extension reports 'not-configured' until then)*.
+- `notes/` — PRIVATE, gitignored: briefs, strategy, competitor analyses, eval data.
+
+## Working agreements
+
+- Git: local commits only, author `affaffaff <affaffaff@users.noreply.github.com>`
+  (repo-local config). NEVER add a remote or push — the user publishes manually
+  under their `affaffaff` GitHub account when ready.
+- Never train or finetune on the CommunityForensics datasets (CC-BY-NC-SA —
+  non-commercial + share-alike would taint our weights). Shipping the authors'
+  own MIT-licensed weights is fine. Details: `notes/model-candidates.md`.
