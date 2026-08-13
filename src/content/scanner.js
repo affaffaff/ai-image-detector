@@ -132,6 +132,8 @@ function renderBadge(img, state) {
   positionBadge(img, b);
 }
 
+let loggedFirstBadge = false;
+
 /** @param {HTMLImageElement} img @param {HTMLElement} badge */
 function positionBadge(img, badge) {
   const rect = img.getBoundingClientRect();
@@ -142,6 +144,25 @@ function positionBadge(img, badge) {
   badge.style.display = '';
   badge.style.left = `${rect.left + window.scrollX + 4}px`;
   badge.style.top = `${rect.top + window.scrollY + 4}px`;
+
+  // Dev builds report the first badge placement once, so "created but
+  // invisible" is distinguishable from "never created" without DevTools
+  // element hunting.
+  if (DEV_BUILD && !loggedFirstBadge) {
+    loggedFirstBadge = true;
+    const br = badge.getBoundingClientRect();
+    console.info(
+      '[ai-image-detector] first badge placed:',
+      JSON.stringify({
+        text: badge.textContent,
+        left: badge.style.left,
+        top: badge.style.top,
+        renderedW: Math.round(br.width),
+        renderedH: Math.round(br.height),
+        hostConnected: badge.isConnected,
+      }),
+    );
+  }
 }
 
 let repositionScheduled = false;
