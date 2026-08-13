@@ -30,6 +30,11 @@
 /** Guard against log(0) / logit(1) in downstream fusion. */
 export const PROB_EPS = 1e-6;
 
+/**
+ * @param {number} p
+ * @param {number} [eps]
+ * @returns {number}
+ */
 export function clampProb(p, eps = PROB_EPS) {
   if (!Number.isFinite(p)) throw new RangeError(`non-finite probability: ${p}`);
   return Math.min(1 - eps, Math.max(eps, p));
@@ -51,13 +56,17 @@ export class MonotoneCalibrator {
       throw new RangeError('calibration table needs at least 2 knots');
     }
     for (let i = 1; i < xs.length; i++) {
+      const xPrev = /** @type {number} */ (xs[i - 1]);
+      const xCur = /** @type {number} */ (xs[i]);
       // xs strictly increasing so interpolation is well defined.
-      if (!(xs[i] > xs[i - 1])) {
+      if (!(xCur > xPrev)) {
         throw new RangeError(`calibration xs not strictly increasing at ${i}`);
       }
+      const yPrev = /** @type {number} */ (ys[i - 1]);
+      const yCur = /** @type {number} */ (ys[i]);
       // ys non-decreasing is the whole legitimacy argument. Fail loud on load
       // rather than silently shipping a curve that reorders images.
-      if (ys[i] < ys[i - 1]) {
+      if (yCur < yPrev) {
         throw new RangeError(`calibration ys not monotone at ${i}`);
       }
     }
@@ -71,29 +80,39 @@ export class MonotoneCalibrator {
    * Map a raw score to a calibrated probability.
    * Inputs outside the fitted range are clamped to the endpoints, which is the
    * correct conservative behaviour: we never extrapolate a curve we did not fit.
+   * @param {number} raw
+   * @returns {number}
    */
   apply(raw) {
     if (!Number.isFinite(raw)) throw new RangeError(`non-finite score: ${raw}`);
     const { xs, ys } = this;
     const n = xs.length;
 
-    if (raw <= xs[0]) return ys[0];
-    if (raw >= xs[n - 1]) return ys[n - 1];
+    if (raw <= /** @type {number} */ (xs[0])) return /** @type {number} */ (ys[0]);
+    if (raw >= /** @type {number} */ (xs[n - 1])) return /** @type {number} */ (ys[n - 1]);
 
     // Binary search for the bracketing interval.
     let lo = 0;
     let hi = n - 1;
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
-      if (xs[mid] <= raw) lo = mid;
+      if (/** @type {number} */ (xs[mid]) <= raw) lo = mid;
       else hi = mid;
     }
 
-    const span = xs[hi] - xs[lo];
-    const t = span === 0 ? 0 : (raw - xs[lo]) / span;
-    return ys[lo] + t * (ys[hi] - ys[lo]);
+    const xLo = /** @type {number} */ (xs[lo]);
+    const xHi = /** @type {number} */ (xs[hi]);
+    const yLo = /** @type {number} */ (ys[lo]);
+    const yHi = /** @type {number} */ (ys[hi]);
+    const span = xHi - xLo;
+    const t = span === 0 ? 0 : (raw - xLo) / span;
+    return yLo + t * (yHi - yLo);
   }
 
+  /**
+   * @param {string | {xs: number[], ys: number[], id?: string, fittedOn?: string}} json
+   * @returns {MonotoneCalibrator}
+   */
   static fromJSON(json) {
     return new MonotoneCalibrator(typeof json === 'string' ? JSON.parse(json) : json);
   }

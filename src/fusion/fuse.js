@@ -25,11 +25,19 @@ import { MonotoneCalibrator, clampProb, PROB_EPS } from './calibration.js';
 /** The bounty fixes this. It is not a tunable. */
 export const DECISION_THRESHOLD = 0.65;
 
+/**
+ * @param {number} p
+ * @returns {number}
+ */
 export function logit(p) {
   const c = clampProb(p);
   return Math.log(c / (1 - c));
 }
 
+/**
+ * @param {number} x
+ * @returns {number}
+ */
 export function sigmoid(x) {
   if (x >= 0) return 1 / (1 + Math.exp(-x));
   const e = Math.exp(x);
@@ -54,6 +62,16 @@ export function sigmoid(x) {
  */
 
 /**
+ * @typedef {Object} Contribution
+ * @property {string} name
+ * @property {number} bits        - w_i · LLR in bits; Infinity on the override path
+ * @property {number} [raw]
+ * @property {number} [calibrated]
+ * @property {number} [weight]
+ * @property {string} [reason]
+ */
+
+/**
  * @param {SignalReading[]} signals
  * @param {Object} cfg
  * @param {Record<string, SignalConfig>} cfg.signals
@@ -63,7 +81,7 @@ export function sigmoid(x) {
  * @param {MonotoneCalibrator} cfg.fusedCalibrator
  * @param {number} [cfg.maxAbsLogOdds]   - clamp on |L|, limits how far correlated
  *                                         signals can stack into false certainty
- * @returns {{probability: number, isAI: boolean, contributions: Array, path: string}}
+ * @returns {{probability: number, isAI: boolean, contributions: Contribution[], path: 'override' | 'fusion'}}
  */
 export function fuse(signals, cfg) {
   const {
