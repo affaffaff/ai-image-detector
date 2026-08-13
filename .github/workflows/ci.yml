@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # The bounty requires a build the maintainers reproduce themselves.
+      # Building twice and diffing hashes proves the toolchain is
+      # deterministic; .gitattributes (eol=lf) keeps source bytes identical
+      # across platforms so this holds beyond CI too.
+      - name: reproducible build (twice, byte-identical)
+        run: |
+          npm run build
+          find dist -type f | sort | xargs sha256sum > /tmp/build1.sum
+          npm run build
+          find dist -type f | sort | xargs sha256sum > /tmp/build2.sum
+          diff /tmp/build1.sum /tmp/build2.sum
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  calibration-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+
+      - run: pip install -r tools/requirements.txt
+
+      # Synthetic-data end-to-end: fit, shift, and verify the 0.65 boundary
+      # placement plus monotonicity of the emitted knot table.
+      - name: calibration fitting smoke test
+        run: python tools/test_fit_calibration_smoke.py

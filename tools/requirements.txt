@@ -1,0 +1,4 @@
+# Offline fitting tools only — nothing here ships in or runs inside the
+# extension. Pinned exactly for reproducibility.
+numpy==2.5.2
+scikit-learn==1.9.0
