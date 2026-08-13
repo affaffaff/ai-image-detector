@@ -1,0 +1,10 @@
+# Reproducible builds require identical source bytes on every platform.
+# Everything text is LF, always, everywhere — Windows dev and Linux CI must
+# feed the bundler the same input or dist/ cannot be byte-identical.
+* text=auto eol=lf
+
+# Binaries
+*.png binary
+*.ico binary
+*.onnx binary
+*.wasm binary

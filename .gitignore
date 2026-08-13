@@ -1,0 +1,27 @@
+# PRIVATE — briefs, strategy, eval data. Never commit anything from here.
+# See CLAUDE.md: the repo is public from day one; the notes are not.
+/notes/
+
+# Dependencies and build output
+/node_modules/
+/dist/
+
+# Model weights are downloaded at setup and hash-verified against
+# models/manifest.json (which IS committed). Weight binaries never enter git.
+/models/weights/
+*.onnx
+
+# Eval datasets and score arrays — never committed before submission
+/data/
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+/.venv/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
