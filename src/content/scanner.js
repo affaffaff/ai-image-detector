@@ -170,6 +170,10 @@ function ensurePort() {
   port = chrome.runtime.connect({ name: PORT_SCAN });
   port.onMessage.addListener(onScanUpdate);
   port.onDisconnect.addListener(() => {
+    // Reading lastError marks it checked — otherwise Chrome logs an
+    // "Unchecked runtime.lastError" against the extension every time a tab
+    // with an open port navigates into the back/forward cache.
+    void chrome.runtime.lastError;
     port = null;
     // SW died or extension reloaded: re-request everything still pending.
     setTimeout(() => {
@@ -181,6 +185,14 @@ function ensurePort() {
   });
   return port;
 }
+
+// Disconnect proactively when this page enters the back/forward cache, so the
+// channel closes cleanly instead of being torn down by the browser. ensurePort
+// reconnects lazily if the page is restored and scanning resumes.
+window.addEventListener('pagehide', () => {
+  port?.disconnect();
+  port = null;
+});
 
 /** @param {HTMLImageElement} img @param {ImgState} state */
 function requestScan(img, state) {
