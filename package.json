@@ -5,12 +5,17 @@
   "private": true,
   "type": "module",
   "license": "MIT",
+  "author": "affaffaff",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/affaffaff/ai-image-detector.git"
+  },
   "engines": {
     "node": ">=26 <27"
   },
   "scripts": {
     "build": "node tools/build.mjs",
-    "test": "node --test test/",
+    "test": "node --test",
     "typecheck": "tsc -p tsconfig.json",
     "check": "npm run typecheck && npm test"
   },

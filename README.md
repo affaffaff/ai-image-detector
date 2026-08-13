@@ -69,8 +69,8 @@ network access after the one-time setup download described below.
 ### From source
 
 ```bash
-git clone <repo-url>
-cd <repo>
+git clone https://github.com/affaffaff/ai-image-detector.git
+cd ai-image-detector
 npm ci
 npm run build          # emits dist/
 ```
