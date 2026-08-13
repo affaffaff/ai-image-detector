@@ -1,0 +1,15 @@
+{
+  "formatVersion": 1,
+  "comment": "Pinned model weights: public URL + SHA-256, verified at setup download time. No url/sha256 pinned yet — the in-browser bake-off (build order step 2) decides the checkpoint. Until then the extension reports model state 'not-configured'. Every entry must pass the three-way license check (weights, base model, training data) for MIT-compatible redistribution before landing here.",
+  "models": [
+    {
+      "id": "detector-primary",
+      "url": null,
+      "sha256": null,
+      "bytes": null,
+      "license": null,
+      "source": null,
+      "notes": "Primary ONNX detector, ~22MB int8 budget. Candidates under evaluation in the bake-off."
+    }
+  ]
+}

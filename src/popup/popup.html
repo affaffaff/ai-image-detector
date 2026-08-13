@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px/1.5 system-ui, sans-serif;
+        width: 280px;
+        margin: 0;
+        padding: 14px;
+        background: #16161a;
+        color: #e8e8ec;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      .row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; }
+      .muted { color: #9a9aa4; }
+      .status { font-weight: 600; }
+      .status.ready { color: #4cc38a; }
+      .status.missing, .status.error { color: #e5484d; }
+      .status.not-configured { color: #f0b429; }
+      .status.downloading { color: #6ca8f2; }
+      progress { width: 100%; height: 6px; }
+      .privacy { margin-top: 12px; padding-top: 10px; border-top: 1px solid #2a2a30; color: #9a9aa4; font-size: 11px; }
+      label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+      .dev { margin-top: 10px; font-size: 11px; color: #9a9aa4; }
+    </style>
+  </head>
+  <body>
+    <h1>AI Image Detector</h1>
+    <div class="row">
+      <span class="muted">Detection</span>
+      <label><input type="checkbox" id="enabled" /> enabled</label>
+    </div>
+    <div class="row">
+      <span class="muted">Model</span>
+      <span class="status" id="model-state">…</span>
+    </div>
+    <progress id="model-progress" max="1" value="0" hidden></progress>
+    <div class="row">
+      <span class="muted">Scanned this session</span>
+      <span id="scanned">…</span>
+    </div>
+    <div class="dev">
+      <label><input type="checkbox" id="dev-mock" /> developer: mock engine (labeled, not real inference)</label>
+    </div>
+    <div class="privacy">
+      Every image is analyzed on this device. Nothing — no pixels, URLs, or
+      scores — ever leaves your browser.
+    </div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
