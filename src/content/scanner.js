@@ -301,7 +301,12 @@ function considerImage(img) {
     img.addEventListener('load', () => considerImage(img), { once: true });
     return;
   }
-  if (Math.min(img.naturalWidth, img.naturalHeight) < MIN_IMAGE_EDGE) {
+  // Judge on the larger of natural and displayed size: an upscaled small file
+  // is still a real image on the page, and that is what the user sees.
+  const rect = img.getBoundingClientRect();
+  const naturalEdge = Math.min(img.naturalWidth, img.naturalHeight);
+  const displayedEdge = Math.min(rect.width, rect.height);
+  if (Math.max(naturalEdge, displayedEdge) < MIN_IMAGE_EDGE) {
     states.set(img, { id: '', url, phase: 'skipped', badge: null, update: null });
     return;
   }

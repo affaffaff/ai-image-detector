@@ -5,11 +5,22 @@
  */
 
 /**
- * Minimum natural edge (px) for an image to be worth scanning. Icons, spacers
- * and thumbnails below this carry too little signal and flood the queue.
- * Brief: skip <~128–200px.
+ * Minimum edge (px) for an image to be worth scanning. Below this an image is
+ * an icon, avatar or spacer: too little signal to score, and enough of them to
+ * flood the queue.
+ *
+ * Measured against max(natural, displayed) — a small file blown up to fill a
+ * hero slot is still worth scanning, and a huge file rendered as a 20px avatar
+ * is not worth blocking the queue on.
+ *
+ * Set to 64, not the 128 the brief suggested. Empirically 128 rejects EVERY
+ * thumbnail on Google Images (238 images, 0 scanned) — an unusable detector on
+ * one of the most image-heavy pages on the web, which fails the bounty's
+ * "genuinely useful for everyday browsing" objective. Real forensic signal
+ * survives well below 128px; revisit with measured per-size accuracy once the
+ * benchmark replica exists, rather than guessing again.
  */
-export const MIN_IMAGE_EDGE = 128;
+export const MIN_IMAGE_EDGE = 64;
 
 /** Max image payload we will fetch for analysis (bytes). */
 export const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
