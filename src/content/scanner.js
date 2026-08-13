@@ -324,6 +324,12 @@ function boot() {
     attributes: true,
     attributeFilter: ['src', 'srcset'],
   });
+  // One line, page console, so "is the scanner even running here?" is a
+  // two-second question. Nothing sensitive is ever logged.
+  console.info(
+    `[ai-image-detector] scanner active in ${window === top ? 'top frame' : 'iframe'}, ` +
+      `${document.images.length} <img> present at boot`,
+  );
 }
 
 function teardown() {
