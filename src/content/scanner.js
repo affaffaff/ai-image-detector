@@ -20,7 +20,7 @@
  */
 
 import { MSG, PORT_SCAN } from '../shared/messages.js';
-import { MIN_IMAGE_EDGE, VIEWPORT_MARGIN, ENABLED_FLAG } from '../shared/constants.js';
+import { MIN_IMAGE_EDGE, VIEWPORT_MARGIN, ENABLED_FLAG, DEV_BUILD } from '../shared/constants.js';
 
 /** @typedef {import('../shared/messages.js').ScanUpdate} ScanUpdate */
 
@@ -77,6 +77,18 @@ function ensureOverlay() {
     .real    { background: rgba(34,122,84,.92); }
     .setup   { background: rgba(178,124,0,.92); }
     .mock    { outline: 2px dashed rgba(255,255,255,.75); }
+    .hud {
+      position: fixed;
+      bottom: 8px;
+      left: 8px;
+      background: rgba(20,20,26,.92);
+      color: #f0b429;
+      font: 600 11px/1.8 ui-monospace, monospace;
+      padding: 0 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(240,180,41,.4);
+      pointer-events: none;
+    }
   `;
   overlayRoot.appendChild(style);
   document.documentElement.appendChild(host);
@@ -342,6 +354,35 @@ function boot() {
     `[ai-image-detector] scanner active in ${window === top ? 'top frame' : 'iframe'}, ` +
       `${document.images.length} <img> present at boot`,
   );
+  if (DEV_BUILD && window === top) startHud();
+}
+
+// ---------------------------------------------------------------------------
+// Dev HUD: a corner pill showing live counts. Dev builds only — compiled out
+// of release entirely. Answers "is the scanner running here, and what is it
+// deciding?" without opening DevTools.
+
+function startHud() {
+  const root = ensureOverlay();
+  const hud = document.createElement('div');
+  hud.className = 'hud';
+  root.appendChild(hud);
+  const tick = () => {
+    const imgs = document.images.length;
+    let queued = 0;
+    let scored = 0;
+    let skipped = 0;
+    for (const img of document.images) {
+      const s = states.get(img);
+      if (!s) continue;
+      if (s.phase === 'skipped') skipped++;
+      else if (s.phase === 'scored') scored++;
+      else if (s.phase === 'pending') queued++;
+    }
+    hud.textContent = `AID dev · ${imgs} img · ${scored} scored · ${queued} pending · ${skipped} too-small`;
+  };
+  tick();
+  setInterval(tick, 500);
 }
 
 function teardown() {
@@ -352,11 +393,21 @@ function teardown() {
   pendingByUrl.clear();
 }
 
-chrome.storage.local.get(ENABLED_FLAG).then((got) => {
-  const v = got[ENABLED_FLAG];
-  enabled = v === undefined ? true : Boolean(v);
-  if (enabled) boot();
-});
+chrome.storage.local
+  .get(ENABLED_FLAG)
+  .then((got) => {
+    const v = got[ENABLED_FLAG];
+    enabled = v === undefined ? true : Boolean(v);
+    if (enabled) boot();
+  })
+  .catch((err) => {
+    // Fail OPEN, never silent. A rejected storage read (orphaned context after
+    // an extension reload, storage unavailable) previously left the scanner
+    // dead with no badge and no log — indistinguishable from "not injected".
+    console.warn('[ai-image-detector] storage read failed, scanning anyway:', err);
+    enabled = true;
+    boot();
+  });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !(ENABLED_FLAG in changes)) return;

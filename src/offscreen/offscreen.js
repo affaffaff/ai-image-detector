@@ -19,7 +19,7 @@
  */
 
 import { MSG, TARGET } from '../shared/messages.js';
-import { DEV_MOCK_FLAG, MAX_IMAGE_BYTES } from '../shared/constants.js';
+import { DEV_MOCK_FLAG, DEV_MOCK_DEFAULT, MAX_IMAGE_BYTES } from '../shared/constants.js';
 import { getInstalledModel, downloadAndInstall, sha256Hex } from './download.js';
 
 /** @typedef {import('./download.js').ModelManifestEntry} ModelManifestEntry */
@@ -129,7 +129,8 @@ function inferMock(sha256) {
 
 async function devMockEnabled() {
   const got = await chrome.storage.local.get(DEV_MOCK_FLAG);
-  return Boolean(got[DEV_MOCK_FLAG]);
+  const v = got[DEV_MOCK_FLAG];
+  return v === undefined ? DEV_MOCK_DEFAULT : Boolean(v);
 }
 
 // ---------------------------------------------------------------------------

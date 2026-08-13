@@ -32,5 +32,20 @@ export const SCAN_MEMO_MAX = 500;
  */
 export const DEV_MOCK_FLAG = 'devMockInference';
 
+/**
+ * True only in `npm run build:dev` output. Release builds compile this to
+ * `false`, so the mock engine is off by default and its branch is dead-code
+ * eliminated. A shipped build must never display a fabricated score unless a
+ * user deliberately opts in.
+ */
+export const DEV_BUILD = __DEV_BUILD__;
+
+/**
+ * Default state of the mock engine when the user has never touched the toggle:
+ * ON for dev builds (load unpacked and immediately see the pipeline work),
+ * OFF for release builds.
+ */
+export const DEV_MOCK_DEFAULT = DEV_BUILD;
+
 /** storage.local flag: master enable. Default true. */
 export const ENABLED_FLAG = 'enabled';

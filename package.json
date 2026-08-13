@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "node tools/build.mjs",
+    "build:dev": "node tools/build.mjs --dev",
     "test": "node --test",
     "typecheck": "tsc -p tsconfig.json",
     "check": "npm run typecheck && npm test"

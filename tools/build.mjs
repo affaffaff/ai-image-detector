@@ -16,13 +16,30 @@
  */
 
 import { build } from 'esbuild';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = join(ROOT, 'src');
 const DIST = join(ROOT, 'dist');
+
+/**
+ * Dev builds (`npm run build:dev`) enable the mock engine by default so the
+ * pipeline is visible without model weights, and rename the extension so a dev
+ * build can never be mistaken for the real one. The RELEASE build — the one CI
+ * verifies and maintainers reproduce — compiles __DEV_BUILD__ to false, which
+ * dead-code-eliminates every mock default.
+ */
+const DEV = process.argv.includes('--dev');
 
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(DIST, { recursive: true });
@@ -49,6 +66,7 @@ for (const b of bundles) {
     minify: false, // maintainers audit dist/ against src/ — keep it readable
     sourcemap: false,
     legalComments: 'inline',
+    define: { __DEV_BUILD__: DEV ? 'true' : 'false' },
   });
 }
 
@@ -78,6 +96,14 @@ for (const [from, to] of copies) {
   cpSync(from, to);
 }
 
+// Dev builds are labeled in the extension list and popup title.
+if (DEV) {
+  const path = join(DIST, 'manifest.json');
+  const m = JSON.parse(readFileSync(path, 'utf8'));
+  m.name = `${m.name} (DEV — simulated scores)`;
+  writeFileSync(path, JSON.stringify(m, null, 2) + '\n');
+}
+
 // ---------------------------------------------------------------------------
 // Post-build check: every path the manifest references must exist in dist.
 
@@ -100,4 +126,7 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-console.log(`built dist/ — ${bundles.length} bundles, ${copies.length} assets, manifest check ok`);
+console.log(
+  `built dist/ [${DEV ? 'DEV — mock engine on by default' : 'RELEASE'}] — ` +
+    `${bundles.length} bundles, ${copies.length} assets, manifest check ok`,
+);
