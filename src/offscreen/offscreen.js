@@ -22,15 +22,19 @@ import {
   MAX_IMAGE_BYTES,
   IMAGE_FETCH_TIMEOUT_MS,
   INFER_JOB_TIMEOUT_MS,
+  FETCH_CONCURRENCY,
+  INFER_CONCURRENCY,
 } from '../shared/constants.js';
 import { isInlinePayloadTooLarge } from '../shared/inline-payload.js';
 import {
   getInstalledModel,
+  getInstalledModelBytes,
   getPartialDownloadProgress,
   downloadAndInstall,
   sha256Hex,
 } from './download.js';
 import { createOrtEngine } from './ort-engine.js';
+import { createInferQueue } from './infer-queue.js';
 
 /** @typedef {import('./download.js').ModelManifestEntry} ModelManifestEntry */
 /** @typedef {import('../shared/messages.js').ModelStatus} ModelStatus */
@@ -102,6 +106,7 @@ async function runDownload() {
     });
     enginePromise = null;
     modelStatus = { state: 'ready', modelId: primary.id, modelSha256: primary.sha256 ?? undefined };
+    scheduleEngineWarmup();
     return modelStatus;
   } catch (err) {
     modelStatus = {
@@ -186,19 +191,18 @@ async function readCapped(res, limit) {
 }
 
 /**
- * Fetch and decode an image. No cookies, streaming size cap, hard timeout, EXIF
- * orientation honoured so pixels match what the user actually sees.
+ * Fetch image bytes. No cookies, streaming size cap, hard timeout.
  *
- * The timeout is not defensive polish. Inference is serialized, so one request
- * that never settles stalls every image queued behind it — and the evaluation
+ * Decode is deferred until the infer slot so we hold compressed bytes rather
+ * than decoded bitmaps in the prefetch pipeline. The timeout is not defensive
+ * polish: a hung acquire occupies a FETCH_CONCURRENCY slot. The evaluation
  * disables the network after setup, which is precisely the condition that
  * produces requests that never settle.
  *
  * @param {string} url
- * @param {AbortSignal} [signal]
- * @returns {Promise<{bitmap: ImageBitmap, bytes: ArrayBuffer}>}
+ * @returns {Promise<{bytes: ArrayBuffer, type: string}>}
  */
-async function acquireImage(url, signal) {
+async function fetchImageBytes(url) {
   if (url.startsWith('blob:')) {
     // Content-script scanner converts page-scoped blob: URLs to data: URLs
     // before requesting a scan. Anything that still arrives as blob: cannot
@@ -211,8 +215,6 @@ async function acquireImage(url, signal) {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('image fetch timed out')), IMAGE_FETCH_TIMEOUT_MS);
-  const onAbort = () => controller.abort(signal?.reason);
-  signal?.addEventListener('abort', onAbort, { once: true });
 
   try {
     // force-cache is what keeps scanning working once the evaluation severs the
@@ -226,40 +228,53 @@ async function acquireImage(url, signal) {
     if (!res.ok) throw new Error(`image fetch failed: HTTP ${res.status}`);
 
     const bytes = await readCapped(res, MAX_IMAGE_BYTES);
-    const blob = new Blob([bytes], { type: res.headers.get('content-type') ?? '' });
-    const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-    return { bitmap, bytes };
+    return { bytes, type: res.headers.get('content-type') ?? '' };
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener('abort', onAbort);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Engines
 
-/**
- * Real inference: ORT session over the OPFS weight file, tiling at NATIVE
- * resolution (never whole-image resize — that destroys the forensic signal).
- * Tile probabilities use the manifest aggregation rule (max by default).
- * @param {ImageBitmap} bitmap
- * @returns {Promise<number>} raw detector score in [0, 1]
- */
-async function inferOrt(bitmap) {
+function ensureEngine() {
   if (!enginePromise) {
     enginePromise = (async () => {
       const entries = await loadManifest();
       const primary = entries[0];
       if (!primary) throw new Error('empty models/manifest.json');
-      const file = await getInstalledModel(primary);
-      if (!file) throw new Error(`installed model '${primary.id}' is missing or has the wrong size`);
-      return createOrtEngine(primary, file);
+      const bytes = await getInstalledModelBytes(primary);
+      if (!bytes) throw new Error(`installed model '${primary.id}' is missing or has the wrong size`);
+      return createOrtEngine(primary, bytes);
     })();
     enginePromise.catch(() => {
       enginePromise = null;
     });
   }
-  const engine = await enginePromise;
+  return enginePromise;
+}
+
+/**
+ * Load WASM/WebGPU and compile kernels before the first visible image asks.
+ * Skipped in unit tests (no chrome.runtime.id) so fake ONNX bytes do not hang
+ * the Node runner on a WASM fetch.
+ */
+function scheduleEngineWarmup() {
+  if (!chrome.runtime?.id) return;
+  void ensureEngine().catch((err) => {
+    // A verified weight file is necessary but not sufficient for a working
+    // detector. Surface missing/incompatible ORT assets in the popup instead
+    // of continuing to advertise READY while every scan fails.
+    modelStatus = {
+      state: 'error',
+      detail: `runtime initialization failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  });
+}
+
+/** @param {ImageBitmap} bitmap */
+async function inferOrt(bitmap) {
+  const engine = await ensureEngine();
   return engine.infer(bitmap);
 }
 
@@ -275,19 +290,23 @@ function inferMock(sha256) {
 }
 
 // ---------------------------------------------------------------------------
-// Serialized inference queue (concurrency 1 until measured)
+// Fetch pipeline + serialized infer slot
 
-/** @type {Promise<unknown>} */
-let queueTail = Promise.resolve();
+const inferQueue = createInferQueue({
+  fetchConcurrency: FETCH_CONCURRENCY,
+  inferConcurrency: INFER_CONCURRENCY,
+  /** @param {import('../shared/messages.js').InferRequest} req */
+  priorityOf: (req) => (typeof req.priority === 'number' && Number.isFinite(req.priority) ? req.priority : 0),
+  acquire: (req) => fetchImageBytes(req.url),
+  run: (req, fetched) => runInferFromFetched(req, fetched),
+});
 
 /**
  * @param {import('../shared/messages.js').InferRequest} req
  * @returns {Promise<import('../shared/messages.js').InferResult>}
  */
 function enqueueInfer(req) {
-  const job = queueTail.then(() => runInfer(req));
-  queueTail = job.catch(() => {});
-  return job;
+  return inferQueue.enqueue(req).catch((err) => ({ id: req.id, ok: false, error: String(err) }));
 }
 
 /**
@@ -323,26 +342,30 @@ function withDeadline(promise, ms, controller) {
 
 /**
  * @param {import('../shared/messages.js').InferRequest} req
+ * @param {{bytes: ArrayBuffer, type: string}} fetched
  * @returns {Promise<import('../shared/messages.js').InferResult>}
  */
-async function runInfer(req) {
+async function runInferFromFetched(req, fetched) {
   const controller = new AbortController();
-  return withDeadline(runInferInner(req, controller.signal), INFER_JOB_TIMEOUT_MS, controller).catch(
+  return withDeadline(runInferInner(req, fetched, controller.signal), INFER_JOB_TIMEOUT_MS, controller).catch(
     (err) => ({ id: req.id, ok: false, error: String(err) }),
   );
 }
 
 /**
  * @param {import('../shared/messages.js').InferRequest} req
+ * @param {{bytes: ArrayBuffer, type: string}} fetched
  * @param {AbortSignal} signal
  * @returns {Promise<import('../shared/messages.js').InferResult>}
  */
-async function runInferInner(req, signal) {
+async function runInferInner(req, fetched, signal) {
   const started = performance.now();
   try {
-    const { bitmap, bytes } = await acquireImage(req.url, signal);
+    if (signal.aborted) throw signal.reason ?? new Error('scan job aborted');
+    const blob = new Blob([fetched.bytes], { type: fetched.type });
+    const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
     try {
-      const hash = await sha256Hex(bytes);
+      const hashPromise = sha256Hex(fetched.bytes);
       // Default status is 'missing' until the startup refresh lands. A scan
       // that arrives in that window used to return no-model even when the
       // OPFS install was already valid — and the content-script latch then
@@ -350,7 +373,7 @@ async function runInferInner(req, signal) {
       const status =
         modelStatus.state === 'ready' ? modelStatus : await currentModelStatus();
       if (status.state === 'ready') {
-        const raw = await inferOrt(bitmap);
+        const [raw, hash] = await Promise.all([inferOrt(bitmap), hashPromise]);
         return {
           id: req.id,
           ok: true,
@@ -361,6 +384,7 @@ async function runInferInner(req, signal) {
           ms: performance.now() - started,
         };
       }
+      const hash = await hashPromise;
       if (__DEV_BUILD__ && req.allowMock) {
         return {
           id: req.id,
@@ -403,5 +427,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-// Prime the status cache so the first scan doesn't pay for it.
-void refreshModelStatus().catch(() => {});
+// Prime the status cache so the first scan doesn't pay for it, and start
+// engine warmup so the first badge does not wait on WASM/WebGPU compile.
+void refreshModelStatus()
+  .then((status) => {
+    if (status.state === 'ready') scheduleEngineWarmup();
+  })
+  .catch(() => {});

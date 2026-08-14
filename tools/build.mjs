@@ -95,12 +95,12 @@ const copies = [
   [join(SRC, 'popup/popup.html'), join(DIST, 'popup/popup.html')],
   [join(ROOT, 'models/manifest.json'), join(DIST, 'models/manifest.json')],
   [
-    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm'),
-    join(DIST, 'ort/ort-wasm-simd-threaded.wasm'),
+    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm'),
+    join(DIST, 'ort/ort-wasm-simd-threaded.asyncify.wasm'),
   ],
   [
-    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs'),
-    join(DIST, 'ort/ort-wasm-simd-threaded.mjs'),
+    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs'),
+    join(DIST, 'ort/ort-wasm-simd-threaded.asyncify.mjs'),
   ],
 ];
 for (const name of ['icon16.png', 'icon48.png', 'icon128.png']) {
@@ -129,7 +129,7 @@ for (const [from, to] of copies) {
 if (DEV || LOCAL_MODEL) {
   const path = join(DIST, 'manifest.json');
   const m = JSON.parse(readFileSync(path, 'utf8'));
-  m.name = DEV ? `${m.name} (DEV — simulated scores)` : `${m.name} (LOCAL MODEL TEST)`;
+  m.name = DEV ? `${m.name} (DEV — simulated scores)` : `${m.name} (Local Model)`;
   writeFileSync(path, JSON.stringify(m, null, 2) + '\n');
 }
 
@@ -169,6 +169,27 @@ const referenced = [
 const missing = referenced.filter((p) => !existsSync(join(DIST, p)));
 if (missing.length > 0) {
   console.error('manifest references missing files:', missing);
+  process.exit(1);
+}
+
+// ONNX Runtime chooses its companion module/WASM variant at bundle time. Keep
+// this check coupled to the emitted bundle so switching ORT entry points cannot
+// silently copy a different variant and leave every browser scan failing at
+// initWasm().
+const offscreenBundle = readFileSync(join(DIST, 'offscreen', 'offscreen.js'), 'utf8');
+const ortRuntimeAssets = [
+  ...new Set(
+    offscreenBundle.match(/ort-wasm-simd-threaded(?:\.[a-z]+)?\.(?:mjs|wasm)/g) ?? [],
+  ),
+];
+const missingOrtRuntimeAssets = ortRuntimeAssets.filter(
+  (name) => !existsSync(join(DIST, 'ort', name)),
+);
+if (ortRuntimeAssets.length === 0 || missingOrtRuntimeAssets.length > 0) {
+  console.error(
+    'ONNX Runtime bundle references missing companion assets:',
+    missingOrtRuntimeAssets.length > 0 ? missingOrtRuntimeAssets : '(none detected in bundle)',
+  );
   process.exit(1);
 }
 assertShippingContract({ root: ROOT, dist: DIST, localTest: Boolean(LOCAL_MODEL) });

@@ -239,6 +239,18 @@ export function resetImageObservation(observer, image) {
 }
 
 /**
+ * Whether a painted box intersects the viewport (no rootMargin). Used to
+ * give on-screen images infer-queue priority over prefetch candidates.
+ *
+ * @param {{top: number, left: number, bottom: number, right: number}} rect
+ * @param {{width: number, height: number}} viewport
+ * @returns {boolean}
+ */
+export function isRectInViewport(rect, viewport) {
+  return rect.bottom > 0 && rect.right > 0 && rect.top < viewport.height && rect.left < viewport.width;
+}
+
+/**
  * Page overlays communicate completed verdicts only. A pending scan is an
  * implementation detail; rendering an ellipsis for every visible candidate
  * covers image-heavy pages in controls and exposes duplicate viewer layers
@@ -310,6 +322,40 @@ export function shouldSuppressPendingBadge(pending, settled) {
   const badgesCollide = smallerRectOverlap(pending.badge, settled.badge) > 0;
   const sameVisualArea = smallerRectOverlap(pending.host, settled.host) >= 0.8;
   return badgesCollide && sameVisualArea;
+}
+
+/**
+ * A badge anchored to the image's own top-left corner disappears as soon as
+ * that corner scrolls out of view, which for a tall image means losing the
+ * label while most of the picture is still on screen. Anchor to the top-left
+ * of the image's *visible* intersection instead, so the badge slides along the
+ * clipped edge and stays put until the image genuinely leaves.
+ *
+ * `clip` is the viewport intersected with any scrolling ancestor, so a badge
+ * inside a scroll container never escapes it.
+ *
+ * Regression: candidate.test.js 'badge anchor sticks to the visible edge'.
+ *
+ * @param {Object} input
+ * @param {{left: number, top: number, right: number, bottom: number}} input.rect painted image rect, viewport coords
+ * @param {{left: number, top: number, right: number, bottom: number}} input.clip visible region, viewport coords
+ * @param {number} input.inset padding from the visible corner, in px
+ * @param {number} [input.minVisible] hide below this many visible px on either axis
+ * @returns {{x: number, y: number, visible: boolean}}
+ */
+export function badgeAnchorPoint(input) {
+  const { rect, clip, inset } = input;
+  const minVisible = input.minVisible ?? 0;
+  const left = Math.max(rect.left, clip.left);
+  const top = Math.max(rect.top, clip.top);
+  const right = Math.min(rect.right, clip.right);
+  const bottom = Math.min(rect.bottom, clip.bottom);
+  if (!(right - left > minVisible && bottom - top > minVisible)) {
+    return { x: 0, y: 0, visible: false };
+  }
+  // Inset from the visible corner, but never past the far edge: on a sliver
+  // thinner than the inset that would place the badge outside the image.
+  return { x: Math.min(left + inset, right), y: Math.min(top + inset, bottom), visible: true };
 }
 
 /**

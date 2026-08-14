@@ -7,7 +7,7 @@
  *
  * Precisely: no scan ever contacts a detector service, and there is none to
  * contact. The scan path does call fetch() once per image, in
- * `offscreen.js#acquireImage`, to read the bytes the page already loaded —
+ * `offscreen.js#fetchImageBytes`, to read the bytes the page already loaded —
  * cross-origin canvas is tainted, so pixels cannot be read from the page. That
  * request goes to the image's own origin with `credentials: 'omit'` and
  * `cache: 'force-cache'`, which is why scanning keeps working after the network
@@ -25,6 +25,9 @@
 const PART_SUFFIX = '.part';
 /** @type {Set<string>} */
 const verifiedThisDocument = new Set();
+/** Bytes from the most recent in-document hash, reused by session create. */
+/** @type {ArrayBuffer | null} */
+let retainedVerifiedBytes = null;
 
 /** @param {ModelManifestEntry} entry */
 function verificationKey(entry) {
@@ -145,17 +148,38 @@ export async function getInstalledModel(entry) {
     // extension update that pins a different artifact with the same byte size.
     // Subsequent popup status polls reuse the in-memory verification result.
     if (entry.sha256 && !verifiedThisDocument.has(key)) {
-      const actual = await sha256Hex(await file.arrayBuffer());
+      const buf = await file.arrayBuffer();
+      const actual = await sha256Hex(buf);
       if (actual !== entry.sha256.toLowerCase()) {
         await dir.removeEntry(entry.id).catch(() => {});
         return null;
       }
       verifiedThisDocument.add(key);
+      retainedVerifiedBytes = buf;
     }
     return file;
   } catch {
     return null;
   }
+}
+
+/**
+ * Verified model bytes for InferenceSession.create. Reuses the buffer from
+ * the one-time in-document hash when it is still available, so startup does
+ * not read the ~24MB artifact twice.
+ *
+ * @param {ModelManifestEntry} entry
+ * @returns {Promise<ArrayBuffer | null>}
+ */
+export async function getInstalledModelBytes(entry) {
+  const file = await getInstalledModel(entry);
+  if (!file) return null;
+  if (retainedVerifiedBytes) {
+    const bytes = retainedVerifiedBytes;
+    retainedVerifiedBytes = null;
+    return bytes;
+  }
+  return file.arrayBuffer();
 }
 
 /**

@@ -282,10 +282,20 @@ const result = expectedMode === 'no-model' ? {
   // of waiting for a memo entry that must never exist.
   const probability = applyCalibration(directRaw);
   const isAI = probability >= 0.65;
+  const expectedPercent = Math.round(probability * 100);
   const expectedInlineBadge = expectedMode === 'mock'
     ? 'MOCK'
-    : `${isAI ? 'AI ' : ''}${Math.round(probability * 100)}%`;
-  if (expectedBadge !== expectedInlineBadge) {
+    : `${isAI ? 'AI ' : ''}${expectedPercent}%`;
+  const displayed = /^(AI )?(\d+)%$/.exec(expectedBadge);
+  // Separate WebGPU runs of the same image may straddle a display-rounding
+  // boundary. Keep the verdict prefix exact and allow only one percentage
+  // point; larger drift still fails as a calibration/runtime regression.
+  const withinWebGpuDisplayTolerance =
+    expectedMode === 'ort' &&
+    displayed !== null &&
+    (displayed[1] ?? '') === (isAI ? 'AI ' : '') &&
+    Math.abs(Number(displayed[2]) - expectedPercent) <= 1;
+  if (expectedBadge !== expectedInlineBadge && !withinWebGpuDisplayTolerance) {
     throw new Error(
       `inline badge calibration mismatch: got ${expectedBadge}, expected ${expectedInlineBadge}`,
     );

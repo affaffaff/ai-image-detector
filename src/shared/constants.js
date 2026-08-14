@@ -28,20 +28,22 @@ export const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 /**
  * Hard deadline on fetching one image's bytes (ms).
  *
- * Load-bearing, not defensive: inference is serialized (INFER_CONCURRENCY = 1),
- * so a single fetch that never settles stalls every remaining image on the
- * page. The evaluation cuts network access after setup, which is exactly the
- * condition that produces hanging requests — an untimed fetch there costs
- * coverage on every image queued behind it, and lost coverage is lost balanced
- * accuracy.
+ * Load-bearing, not defensive: ONNX itself is serialized (INFER_CONCURRENCY = 1),
+ * so a single fetch that never settles used to stall every remaining image on
+ * the page. Bytes now download in parallel (FETCH_CONCURRENCY), but a hung
+ * acquire still occupies a fetch slot. The evaluation cuts network access
+ * after setup, which is exactly the condition that produces hanging requests —
+ * an untimed fetch there costs coverage on every image queued behind it, and
+ * lost coverage is lost balanced accuracy.
  */
 export const IMAGE_FETCH_TIMEOUT_MS = 10_000;
 
 /**
- * Hard deadline on one complete scan job — fetch, decode, and all tile
- * inferences (ms). The fetch timeout alone cannot protect the queue: decode of
- * a malformed image or a wedged WASM session would stall it just as
- * effectively.
+ * Hard deadline on decode plus ONNX for one image (ms). Image bytes now
+ * download on the fetch pipeline with IMAGE_FETCH_TIMEOUT_MS; this deadline
+ * starts when the infer slot is taken so a job queued behind a long page
+ * cannot expire before it runs. Decode of a malformed image or a wedged WASM
+ * session would still stall every image behind it.
  */
 export const INFER_JOB_TIMEOUT_MS = 30_000;
 
@@ -58,8 +60,24 @@ export const URL_CACHE_MAX = 400;
 /** How far outside the viewport we begin scanning (px). */
 export const VIEWPORT_MARGIN = 500;
 
-/** Concurrent inferences in the offscreen document. Keep 1 until measured. */
+/**
+ * Concurrent ONNX session.run calls. Keep 1: the WASM/WebGPU session is
+ * single-threaded (`ort.env.wasm.numThreads = 1`), and overlapping runs on
+ * one session fights itself.
+ */
 export const INFER_CONCURRENCY = 1;
+
+/**
+ * How many images may fetch (and hold) bytes while the infer slot is busy.
+ * Bytes, not decoded bitmaps — a 4K RGBA frame would blow RAM if we decoded
+ * ahead. One extra slot is granted to a strictly higher-priority (visible)
+ * job so prefetch buffers cannot stall an on-screen image.
+ */
+export const FETCH_CONCURRENCY = 4;
+
+/** On-screen images jump the infer queue ahead of rootMargin prefetch. */
+export const SCAN_PRIORITY_NEAR = 0;
+export const SCAN_PRIORITY_VISIBLE = 1;
 
 /** Max entries in the session-scoped scan memo (chrome.storage.session). */
 export const SCAN_MEMO_MAX = 500;

@@ -19,6 +19,7 @@ import {
   DEV_MOCK_FLAG,
   ENABLED_FLAG,
   SCAN_MEMO_MAX,
+  SCAN_PRIORITY_NEAR,
 } from '../shared/constants.js';
 import { isSessionMemoizableUrl } from '../shared/inline-payload.js';
 
@@ -104,33 +105,129 @@ async function loadFusionConfig() {
 
 /** @typedef {Record<string, {update: ScanUpdate, ts: number}>} ScanMemo */
 
+/** @type {ScanMemo | null} */
+let memoCache = null;
+/** @type {Promise<ScanMemo> | null} */
+let memoLoad = null;
+let scanningEnabled = true;
+/** @type {boolean | null} */
+let allowMockCache = null;
+
+void chrome.storage.local.get([ENABLED_FLAG, DEV_MOCK_FLAG]).then((got) => {
+  const enabled = got[ENABLED_FLAG];
+  scanningEnabled = enabled === undefined ? true : Boolean(enabled);
+  const mockSetting = got[DEV_MOCK_FLAG];
+  allowMockCache =
+    __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
+}).catch(() => {});
+
+chrome.storage.onChanged?.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (ENABLED_FLAG in changes) {
+    const v = changes[ENABLED_FLAG]?.newValue;
+    scanningEnabled = v === undefined ? true : Boolean(v);
+  }
+  if (DEV_MOCK_FLAG in changes) {
+    const mockSetting = changes[DEV_MOCK_FLAG]?.newValue;
+    allowMockCache =
+      __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
+  }
+});
+
 /** @returns {Promise<ScanMemo>} */
 async function memoRead() {
   const got = await chrome.storage.session.get('scanMemo');
   return /** @type {ScanMemo} */ (got['scanMemo'] ?? {});
 }
 
+/** @returns {Promise<ScanMemo>} */
+async function memoEnsure() {
+  if (memoCache) return memoCache;
+  if (!memoLoad) {
+    memoLoad = memoRead()
+      .then((scanMemo) => {
+        memoCache = scanMemo;
+        return scanMemo;
+      })
+      .catch((err) => {
+        memoLoad = null;
+        throw err;
+      });
+  }
+  return memoLoad;
+}
+
 /** @param {string} url @returns {Promise<ScanUpdate | null>} */
 async function memoGet(url) {
   if (!isSessionMemoizableUrl(url)) return null;
-  const scanMemo = await memoRead();
+  const scanMemo = await memoEnsure();
   const hit = scanMemo[url];
   return hit ? { ...hit.update } : null;
 }
 
 /** @param {string} url @param {ScanUpdate} update */
-async function memoPut(url, update) {
+function memoPut(url, update) {
   if (!isSessionMemoizableUrl(url)) return;
-  const scanMemo = await memoRead();
-  scanMemo[url] = { update: { ...update, id: '' }, ts: Date.now() };
-  const keys = Object.keys(scanMemo);
-  if (keys.length > SCAN_MEMO_MAX) {
-    keys
-      .sort((a, b) => (scanMemo[a]?.ts ?? 0) - (scanMemo[b]?.ts ?? 0))
-      .slice(0, keys.length - SCAN_MEMO_MAX)
-      .forEach((k) => delete scanMemo[k]);
+  const write = async () => {
+    const scanMemo = await memoEnsure();
+    scanMemo[url] = { update: { ...update, id: '' }, ts: Date.now() };
+    const keys = Object.keys(scanMemo);
+    if (keys.length > SCAN_MEMO_MAX) {
+      keys
+        .sort((a, b) => (scanMemo[a]?.ts ?? 0) - (scanMemo[b]?.ts ?? 0))
+        .slice(0, keys.length - SCAN_MEMO_MAX)
+        .forEach((k) => delete scanMemo[k]);
+    }
+    await chrome.storage.session.set({ scanMemo });
+  };
+  // Persist in the background. The badge must not wait on serializing the
+  // whole session memo through chrome.storage.
+  void write().catch(() => {});
+}
+
+/**
+ * Count of completed scans this session.
+ *
+ * Deliberately NOT derived from the session memo. The memo only holds http(s)
+ * URLs (`isSessionMemoizableUrl`), so counting its keys reported 0 on any page
+ * whose images are inline data: payloads — Google Images being the worst case,
+ * where a fully working scanner still showed "Scanned this session: 0". The
+ * counter must describe work done, not what happened to be cacheable.
+ *
+ * Lives in chrome.storage.session because the service worker dies after ~30s
+ * idle; the in-memory value is a write-through cache, not the source of truth.
+ */
+/** @type {number | null} */
+let scanCountCache = null;
+/** @type {Promise<number> | null} */
+let scanCountLoad = null;
+
+/** @returns {Promise<number>} */
+async function scanCountEnsure() {
+  if (scanCountCache !== null) return scanCountCache;
+  if (!scanCountLoad) {
+    scanCountLoad = chrome.storage.session
+      .get('scanCount')
+      .then((got) => {
+        const value = got['scanCount'];
+        scanCountCache = typeof value === 'number' && Number.isFinite(value) ? value : 0;
+        return scanCountCache;
+      })
+      .catch((err) => {
+        scanCountLoad = null;
+        throw err;
+      });
   }
-  await chrome.storage.session.set({ scanMemo });
+  return scanCountLoad;
+}
+
+function scanCountIncrement() {
+  const write = async () => {
+    const current = await scanCountEnsure();
+    scanCountCache = current + 1;
+    await chrome.storage.session.set({ scanCount: scanCountCache });
+  };
+  void write().catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -143,12 +240,9 @@ async function scanOne(req) {
 
   await ensureOffscreen();
 
-  // Offscreen documents intentionally expose only chrome.runtime, so all
-  // storage-backed configuration must be resolved here and sent with the job.
-  const stored = await chrome.storage.local.get(DEV_MOCK_FLAG);
-  const mockSetting = stored[DEV_MOCK_FLAG];
   const allowMock =
-    __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
+    allowMockCache ??
+    (__DEV_BUILD__ && DEV_MOCK_DEFAULT);
 
   /** @type {InferResult} */
   const result = await chrome.runtime.sendMessage({
@@ -157,6 +251,7 @@ async function scanOne(req) {
     id: req.id,
     url: req.url,
     allowMock,
+    priority: typeof req.priority === 'number' ? req.priority : SCAN_PRIORITY_NEAR,
   });
 
   if (!result.ok) {
@@ -181,7 +276,8 @@ async function scanOne(req) {
     engine: result.engine,
     contributions: fused.contributions.map((c) => ({ name: c.name, bits: c.bits })),
   };
-  await memoPut(req.url, update);
+  memoPut(req.url, update);
+  scanCountIncrement();
   return update;
 }
 
@@ -191,10 +287,16 @@ async function scanOne(req) {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== PORT_SCAN) return;
 
+  // Creating the offscreen host (and therefore starting engine warmup) on
+  // connect — not on the first SCAN_REQUEST — overlaps WASM compile with
+  // the page's own image loading.
+  void ensureOffscreen().catch(() => {});
+  void loadFusionConfig().catch(() => {});
+  void memoEnsure().catch(() => {});
+
   port.onMessage.addListener(async (msg) => {
     if (msg?.type !== MSG.SCAN_REQUEST) return;
-    const { [ENABLED_FLAG]: enabled = true } = await chrome.storage.local.get(ENABLED_FLAG);
-    if (!enabled) {
+    if (!scanningEnabled) {
       try {
         port.postMessage({
           type: MSG.SCAN_UPDATE,
@@ -240,8 +342,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           type: MSG.MODEL_STATUS_GET,
           target: TARGET.OFFSCREEN,
         });
-        const scanMemo = await memoRead();
-        sendResponse({ model, scannedThisSession: Object.keys(scanMemo).length });
+        sendResponse({ model, scannedThisSession: await scanCountEnsure() });
       })().catch((err) => {
         sendResponse({
           model: {

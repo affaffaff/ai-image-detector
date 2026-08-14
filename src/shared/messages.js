@@ -56,6 +56,7 @@ export const TARGET = Object.freeze({
  * @property {string} url       - absolute URL (http/https/data/blob)
  * @property {number} width     - naturalWidth
  * @property {number} height    - naturalHeight
+ * @property {number} [priority] - SCAN_PRIORITY_VISIBLE outranks prefetch
  *
  * @typedef {Object} ScanUpdate
  * @property {string} id
@@ -83,6 +84,7 @@ export const TARGET = Object.freeze({
  * @property {string} url
  * @property {boolean} allowMock - resolved by the service worker because
  *                                 offscreen documents only expose chrome.runtime
+ * @property {number} [priority] - forwarded from the content-script scan request
  *
  * @typedef {'missing' | 'not-configured' | 'downloading' | 'ready' | 'error'} ModelState
  *

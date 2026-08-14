@@ -142,7 +142,7 @@ official checkpoint with `--checkpoint <path>`. The exporter rejects any file
 whose SHA-256 does not match a pinned official artifact.
 
 `build:local-model` embeds the locally exported INT8 artifact and labels the
-extension **LOCAL MODEL TEST**. It exercises the same verified OPFS and ORT
+extension **AI Image Detector (Local Model)**. It exercises the same verified OPFS and ORT
 path, but it is a verification build — not the production package.
 
 ---

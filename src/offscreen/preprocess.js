@@ -140,6 +140,25 @@ export function rgbaToImageNetNchw(rgba, width, height) {
   return output;
 }
 
+/** @type {OffscreenCanvas | null} */
+let workCanvas = null;
+/** @type {OffscreenCanvasRenderingContext2D | null} */
+let workCtx = null;
+
+/**
+ * @param {number} width
+ * @param {number} height
+ * @returns {OffscreenCanvasRenderingContext2D}
+ */
+function getWorkContext(width, height) {
+  if (!workCanvas || !workCtx || workCanvas.width !== width || workCanvas.height !== height) {
+    workCanvas = new OffscreenCanvas(width, height);
+    workCtx = workCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+  }
+  if (!workCtx) throw new Error('2D canvas unavailable for model preprocessing');
+  return workCtx;
+}
+
 /**
  * Rasterize one crop without rescaling and return its input tensor data.
  *
@@ -148,9 +167,7 @@ export function rgbaToImageNetNchw(rgba, width, height) {
  * @returns {Float32Array}
  */
 export function bitmapTileToNchw(bitmap, tile) {
-  const canvas = new OffscreenCanvas(tile.size, tile.size);
-  const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
-  if (!ctx) throw new Error('2D canvas unavailable for model preprocessing');
+  const ctx = getWorkContext(tile.size, tile.size);
 
   // Rounded ImageNet mean maps to approximately zero after normalization.
   ctx.fillStyle = 'rgb(124, 116, 104)';
@@ -180,9 +197,7 @@ export function bitmapTileToNchw(bitmap, tile) {
  */
 export function bitmapOfficialCenterToNchw(bitmap) {
   const plan = planOfficialCenterCrop(bitmap.width, bitmap.height);
-  const canvas = new OffscreenCanvas(plan.resizedWidth, plan.resizedHeight);
-  const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
-  if (!ctx) throw new Error('2D canvas unavailable for model preprocessing');
+  const ctx = getWorkContext(plan.resizedWidth, plan.resizedHeight);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(bitmap, 0, 0, plan.resizedWidth, plan.resizedHeight);

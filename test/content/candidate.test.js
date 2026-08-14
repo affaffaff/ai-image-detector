@@ -6,8 +6,10 @@ import {
   classifyPaintedCandidate,
   cssBackgroundUrls,
   fittedImageRect,
+  badgeAnchorPoint,
   isHostTopmostAtPoint,
   isBackgroundWatchTag,
+  isRectInViewport,
   isSvgImageUrl,
   resetImageObservation,
   shouldRenderBadge,
@@ -31,6 +33,18 @@ test('an intersecting lazy image without a source remains retryable', () => {
   assert.equal(
     classifyImageCandidate({ ...base, complete: false, naturalWidth: 0, naturalHeight: 0 }),
     'wait-load',
+  );
+});
+
+test('on-screen boxes outrank rootMargin prefetch for infer-queue priority', () => {
+  const viewport = { width: 1280, height: 720 };
+  assert.equal(isRectInViewport({ top: 10, left: 10, bottom: 100, right: 100 }, viewport), true);
+  assert.equal(isRectInViewport({ top: 800, left: 10, bottom: 900, right: 100 }, viewport), false);
+  assert.equal(isRectInViewport({ top: -80, left: 10, bottom: -10, right: 100 }, viewport), false);
+  assert.equal(
+    isRectInViewport({ top: 700, left: 10, bottom: 780, right: 100 }, viewport),
+    true,
+    'a box that still intersects the bottom edge is visible',
   );
 });
 
@@ -361,4 +375,71 @@ test('layered copies of one visual keep only the preferred badge', () => {
     false,
     'adjacent tiles remain independent even if their labels touch',
   );
+});
+
+const viewport = { left: 0, top: 0, right: 1000, bottom: 800 };
+
+test('badge anchor sticks to the visible edge', () => {
+  // Fully visible: plain inset from the image's own corner.
+  assert.deepEqual(
+    badgeAnchorPoint({ rect: { left: 100, top: 200, right: 400, bottom: 600 }, clip: viewport, inset: 4 }),
+    { x: 104, y: 204, visible: true },
+  );
+
+  // Scrolled so the top of a tall image is above the viewport: the badge rides
+  // the clipped edge instead of vanishing with the corner. This is the bug.
+  assert.deepEqual(
+    badgeAnchorPoint({ rect: { left: 100, top: -500, right: 400, bottom: 600 }, clip: viewport, inset: 4 }),
+    { x: 104, y: 4, visible: true },
+  );
+
+  // Same on the horizontal axis for a wide image scrolled left.
+  assert.deepEqual(
+    badgeAnchorPoint({ rect: { left: -300, top: 200, right: 400, bottom: 600 }, clip: viewport, inset: 4 }),
+    { x: 4, y: 204, visible: true },
+  );
+});
+
+test('badge anchor is clamped by a scrolling ancestor, not just the viewport', () => {
+  const clip = { left: 50, top: 100, right: 500, bottom: 400 };
+  // Image starts above its scroll container: clamp to the container, so the
+  // badge cannot be drawn outside the scroller it belongs to.
+  assert.deepEqual(
+    badgeAnchorPoint({ rect: { left: 60, top: -200, right: 400, bottom: 300 }, clip, inset: 4 }),
+    { x: 64, y: 104, visible: true },
+  );
+});
+
+test('badge anchor hides an image that has genuinely left the visible region', () => {
+  // Entirely above the viewport.
+  assert.equal(
+    badgeAnchorPoint({ rect: { left: 100, top: -900, right: 400, bottom: -100 }, clip: viewport, inset: 4 }).visible,
+    false,
+  );
+  // Touching edge-on is not visible either (zero-area intersection).
+  assert.equal(
+    badgeAnchorPoint({ rect: { left: 100, top: -400, right: 400, bottom: 0 }, clip: viewport, inset: 4 }).visible,
+    false,
+  );
+  // A sliver thinner than minVisible is suppressed rather than flickering.
+  assert.equal(
+    badgeAnchorPoint({
+      rect: { left: 100, top: -400, right: 400, bottom: 10 },
+      clip: viewport,
+      inset: 4,
+      minVisible: 24,
+    }).visible,
+    false,
+  );
+});
+
+test('badge anchor never lands outside a sliver thinner than its inset', () => {
+  // 2px of image visible at the bottom edge: a blind +4 would place the badge
+  // past the image; the anchor stops at the far edge instead.
+  const anchor = badgeAnchorPoint({
+    rect: { left: 100, top: -400, right: 400, bottom: 2 },
+    clip: viewport,
+    inset: 4,
+  });
+  assert.deepEqual(anchor, { x: 104, y: 2, visible: true });
 });

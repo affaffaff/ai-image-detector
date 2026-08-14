@@ -12,9 +12,9 @@
  *    queue everything" path that defeats it.
  *  - Per-element state lives in a WeakMap; removed images are swept and their
  *    badges removed — no unbounded growth on infinite-scroll pages.
- *  - Badges live in a closed shadow root so page CSS cannot restyle them. They
- *    use viewport-fixed coordinates and are repositioned on capture-phase
- *    scroll events so page and nested scrollers cannot use different origins.
+ *  - Badges live in a closed shadow root so page CSS cannot restyle them.
+ *    Modern Chromium anchors them to image elements in the compositor; older
+ *    versions fall back to viewport coordinates and capture-phase scrolls.
  *  - The scan port reconnects and re-requests pending images when the MV3
  *    service worker dies mid-scan.
  */
@@ -26,15 +26,19 @@ import {
   ENABLED_FLAG,
   DEV_BUILD,
   URL_CACHE_MAX,
+  SCAN_PRIORITY_NEAR,
+  SCAN_PRIORITY_VISIBLE,
 } from '../shared/constants.js';
 import { MAX_INLINE_SCAN_BYTES } from '../shared/inline-payload.js';
 import {
+  badgeAnchorPoint,
   classifyImageCandidate,
   classifyPaintedCandidate,
   cssBackgroundUrls,
   fittedImageRect,
   isHostTopmostAtPoint,
   isBackgroundWatchTag,
+  isRectInViewport,
   resetImageObservation,
   shouldRenderBadge,
   shouldSuppressDuplicateBadge,
@@ -84,6 +88,7 @@ const blobResolved = new WeakMap();
 const blobInFlight = new WeakSet();
 
 let enabled = true;
+let started = false;
 const modelGate = new ModelGate();
 /** Coalesces MODEL_READY + scored-exit so a double delivery does not bump epoch twice. */
 let rescanQueued = false;
@@ -95,6 +100,259 @@ const staleNoModelRetried = new Set();
 
 /** @type {ShadowRoot | null} */
 let overlayRoot = null;
+// Keep the proven viewport overlay until the native-anchor host is exposed to
+// accessibility and paint hit-testing as reliably as the fallback. Chromium
+// can position the zero-sized wrapper correctly while still pruning its closed
+// shadow contents, which makes a completed scan look like it never ran.
+const nativeAnchorPositioning = false;
+let nativeAnchorSeq = 0;
+/**
+ * Native anchor positioning lets Chromium move a badge in the same compositor
+ * pass as its image. The wrapper remains in light DOM so its anchor name can
+ * resolve to a page element; the visible badge stays inside a closed shadow.
+ * @type {WeakMap<HTMLElement, {
+ *   wrapper: HTMLElement,
+ *   host: HTMLElement,
+ *   anchorName: string,
+ *   assignedAnchorNames: string,
+ *   previousInlineAnchorNames: string,
+ *   previousInlinePriority: string,
+ *   scrollContainer: HTMLElement,
+ *   positionLease: boolean,
+ * }>}
+ */
+const nativeBadgeBindings = new WeakMap();
+/**
+ * Static scroll containers need to become containing blocks for their absolute
+ * badge wrappers. Reference counting makes that temporary and reversible.
+ * @type {WeakMap<HTMLElement, {
+ *   count: number,
+ *   previousInlinePosition: string,
+ *   previousInlinePriority: string,
+ * }>}
+ */
+const scrollContainerPositionLeases = new WeakMap();
+
+const overlayStyles = `
+  .badge {
+    position: fixed;
+    font: 700 10px/1.7 ui-monospace, Consolas, "Cascadia Mono", monospace;
+    color: #eaffff;
+    letter-spacing: .4px;
+    padding: 0 7px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    pointer-events: auto;
+    cursor: default;
+    white-space: nowrap;
+    user-select: none;
+    backdrop-filter: blur(2px);
+  }
+  .badge::before {
+    content: "";
+    position: absolute;
+    top: 1px; left: 1px;
+    width: 4px; height: 4px;
+    border-top: 1px solid currentColor;
+    border-left: 1px solid currentColor;
+    opacity: .85;
+    pointer-events: none;
+  }
+  .ai {
+    background: rgba(30,4,18,.88);
+    color: #ff4d8d;
+    border-color: rgba(255,45,120,.85);
+    box-shadow: 0 0 10px rgba(255,45,120,.45), inset 0 0 6px rgba(255,45,120,.18);
+  }
+  .real {
+    background: rgba(2,16,14,.88);
+    color: #00ff9f;
+    border-color: rgba(0,255,159,.7);
+    box-shadow: 0 0 8px rgba(0,255,159,.35), inset 0 0 6px rgba(0,255,159,.14);
+  }
+  .mock {
+    background: rgba(4,7,15,.88);
+    color: #00f0ff;
+    border-color: rgba(0,240,255,.6);
+    box-shadow: 0 0 8px rgba(0,240,255,.25);
+  }
+  .setup {
+    background: rgba(18,12,2,.88);
+    color: #ffd257;
+    border-color: rgba(251,191,36,.75);
+    box-shadow: 0 0 8px rgba(251,191,36,.35);
+  }
+  .setup-notice {
+    position: fixed;
+    right: 14px;
+    bottom: 14px;
+    max-width: min(280px, calc(100vw - 28px));
+    box-sizing: border-box;
+    background: rgba(18,12,2,.94);
+    color: #ffd257;
+    font: 700 11px/1.45 ui-monospace, Consolas, "Cascadia Mono", monospace;
+    letter-spacing: .25px;
+    padding: 8px 11px;
+    border: 1px solid rgba(251,191,36,.7);
+    border-radius: 4px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.38), 0 0 8px rgba(251,191,36,.2);
+    pointer-events: none;
+  }
+  .badge.scored { cursor: pointer; }
+  .popover {
+    position: fixed;
+    min-width: 200px;
+    max-width: 280px;
+    background: rgba(5,9,20,.97);
+    color: #c8d4f0;
+    font: 11px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
+    padding: 10px 12px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,240,255,.45);
+    box-shadow: 0 0 18px rgba(0,240,255,.22), 0 4px 18px rgba(0,0,0,.55);
+    pointer-events: auto;
+    z-index: 1;
+  }
+  .popover > div:first-child {
+    color: #00f0ff;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: .5px;
+    text-shadow: 0 0 8px rgba(0,240,255,.6);
+    margin-bottom: 2px;
+  }
+  .popover .k { color: #5b6b8c; letter-spacing: .3px; }
+  .popover .bits { color: #00f0ff; font-variant-numeric: tabular-nums; }
+  .hud {
+    position: fixed;
+    bottom: 10px;
+    left: 10px;
+    background: rgba(4,7,15,.94);
+    color: #00f0ff;
+    font: 600 11px/1.8 ui-monospace, Consolas, "Cascadia Mono", monospace;
+    letter-spacing: 1px;
+    padding: 0 12px;
+    border-radius: 2px;
+    border: 1px solid rgba(0,240,255,.5);
+    box-shadow: 0 0 12px rgba(0,240,255,.3);
+    pointer-events: none;
+  }
+`;
+
+/** @param {HTMLElement} host @returns {HTMLElement} */
+function scrollContainerFor(host) {
+  for (let parent = host.parentElement; parent; parent = parent.parentElement) {
+    const style = getComputedStyle(parent);
+    const scrollsY =
+      /(auto|scroll|overlay)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight;
+    const scrollsX =
+      /(auto|scroll|overlay)/.test(style.overflowX) && parent.scrollWidth > parent.clientWidth;
+    if (scrollsX || scrollsY) return parent;
+  }
+  return document.documentElement;
+}
+
+/** Padding between the visible image corner and the badge, in CSS px. */
+const BADGE_INSET = 4;
+/** Below this many visible px on an axis, a badge is more noise than label. */
+const BADGE_MIN_VISIBLE = 24;
+/** Vertical drop from the badge anchor to its popover, in CSS px. */
+const POPOVER_DROP = 18;
+
+/**
+ * Ancestor walk cache for {@link clipRectFor}. Every badge is repositioned on
+ * every scroll frame, and an image-heavy page carries hundreds of them, so the
+ * getComputedStyle walk must not run per badge per frame. Cached for the
+ * element's lifetime, matching the assumption the native binding already makes
+ * by resolving its scroll container once at badge creation.
+ * @type {WeakMap<HTMLElement, HTMLElement>}
+ */
+const scrollContainerCache = new WeakMap();
+
+/**
+ * Region a badge for `host` may occupy: the viewport, narrowed by the nearest
+ * scrolling ancestor so a badge cannot be clamped outside its own scroller.
+ * The container is passed in when the caller already has it cached.
+ *
+ * @param {HTMLElement} host
+ * @param {HTMLElement} [scrollContainer]
+ * @returns {{left: number, top: number, right: number, bottom: number}}
+ */
+function clipRectFor(host, scrollContainer) {
+  const clip = {
+    left: 0,
+    top: 0,
+    right: window.innerWidth,
+    bottom: window.innerHeight,
+  };
+  let container = scrollContainer ?? scrollContainerCache.get(host);
+  if (!container) {
+    container = scrollContainerFor(host);
+    scrollContainerCache.set(host, container);
+  }
+  if (container && container !== document.documentElement) {
+    const box = container.getBoundingClientRect();
+    clip.left = Math.max(clip.left, box.left);
+    clip.top = Math.max(clip.top, box.top);
+    clip.right = Math.min(clip.right, box.right);
+    clip.bottom = Math.min(clip.bottom, box.bottom);
+  }
+  return clip;
+}
+
+/** @param {HTMLElement} container @returns {boolean} */
+function acquireScrollContainerPosition(container) {
+  if (container === document.documentElement) return false;
+  const existing = scrollContainerPositionLeases.get(container);
+  if (existing) {
+    existing.count += 1;
+    return true;
+  }
+  if (getComputedStyle(container).position !== 'static') return false;
+  const lease = {
+    count: 1,
+    previousInlinePosition: container.style.getPropertyValue('position'),
+    previousInlinePriority: container.style.getPropertyPriority('position'),
+  };
+  container.style.setProperty('position', 'relative', 'important');
+  scrollContainerPositionLeases.set(container, lease);
+  return true;
+}
+
+/** @param {HTMLElement} container */
+function releaseScrollContainerPosition(container) {
+  const lease = scrollContainerPositionLeases.get(container);
+  if (!lease) return;
+  lease.count -= 1;
+  if (lease.count > 0) return;
+  scrollContainerPositionLeases.delete(container);
+  if (
+    container.style.getPropertyValue('position') !== 'relative' ||
+    container.style.getPropertyPriority('position') !== 'important'
+  ) {
+    return;
+  }
+  if (lease.previousInlinePosition) {
+    container.style.setProperty(
+      'position',
+      lease.previousInlinePosition,
+      lease.previousInlinePriority,
+    );
+  } else {
+    container.style.removeProperty('position');
+  }
+}
+
+/** @param {HTMLElement} element @param {string} property @param {string} value */
+function setImportantStyle(element, property, value) {
+  if (
+    element.style.getPropertyValue(property) === value &&
+    element.style.getPropertyPriority(property) === 'important'
+  ) {
+    return;
+  }
+  element.style.setProperty(property, value, 'important');
+}
 
 function ensureOverlay() {
   if (overlayRoot) return overlayRoot;
@@ -103,114 +361,105 @@ function ensureOverlay() {
     'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
   overlayRoot = host.attachShadow({ mode: 'closed' });
   const style = document.createElement('style');
-  style.textContent = `
-    .badge {
-      position: fixed;
-      font: 700 10px/1.7 ui-monospace, Consolas, "Cascadia Mono", monospace;
-      color: #eaffff;
-      letter-spacing: .4px;
-      padding: 0 7px;
-      border-radius: 3px;
-      border: 1px solid transparent;
-      pointer-events: auto;
-      cursor: default;
-      white-space: nowrap;
-      user-select: none;
-      backdrop-filter: blur(2px);
-    }
-    .badge::before {
-      content: "";
-      position: absolute;
-      top: 1px; left: 1px;
-      width: 4px; height: 4px;
-      border-top: 1px solid currentColor;
-      border-left: 1px solid currentColor;
-      opacity: .85;
-      pointer-events: none;
-    }
-    .ai {
-      background: rgba(30,4,18,.88);
-      color: #ff4d8d;
-      border-color: rgba(255,45,120,.85);
-      box-shadow: 0 0 10px rgba(255,45,120,.45), inset 0 0 6px rgba(255,45,120,.18);
-    }
-    .real {
-      background: rgba(2,16,14,.88);
-      color: #00ff9f;
-      border-color: rgba(0,255,159,.7);
-      box-shadow: 0 0 8px rgba(0,255,159,.35), inset 0 0 6px rgba(0,255,159,.14);
-    }
-    .mock {
-      background: rgba(4,7,15,.88);
-      color: #00f0ff;
-      border-color: rgba(0,240,255,.6);
-      box-shadow: 0 0 8px rgba(0,240,255,.25);
-    }
-    .setup {
-      background: rgba(18,12,2,.88);
-      color: #ffd257;
-      border-color: rgba(251,191,36,.75);
-      box-shadow: 0 0 8px rgba(251,191,36,.35);
-    }
-    .setup-notice {
-      position: fixed;
-      right: 14px;
-      bottom: 14px;
-      max-width: min(280px, calc(100vw - 28px));
-      box-sizing: border-box;
-      background: rgba(18,12,2,.94);
-      color: #ffd257;
-      font: 700 11px/1.45 ui-monospace, Consolas, "Cascadia Mono", monospace;
-      letter-spacing: .25px;
-      padding: 8px 11px;
-      border: 1px solid rgba(251,191,36,.7);
-      border-radius: 4px;
-      box-shadow: 0 4px 18px rgba(0,0,0,.38), 0 0 8px rgba(251,191,36,.2);
-      pointer-events: none;
-    }
-    .badge.scored { cursor: pointer; }
-    .popover {
-      position: fixed;
-      min-width: 200px;
-      max-width: 280px;
-      background: rgba(5,9,20,.97);
-      color: #c8d4f0;
-      font: 11px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
-      padding: 10px 12px;
-      border-radius: 3px;
-      border: 1px solid rgba(0,240,255,.45);
-      box-shadow: 0 0 18px rgba(0,240,255,.22), 0 4px 18px rgba(0,0,0,.55);
-      pointer-events: auto;
-      z-index: 1;
-    }
-    .popover > div:first-child {
-      color: #00f0ff;
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: .5px;
-      text-shadow: 0 0 8px rgba(0,240,255,.6);
-      margin-bottom: 2px;
-    }
-    .popover .k { color: #5b6b8c; letter-spacing: .3px; }
-    .popover .bits { color: #00f0ff; font-variant-numeric: tabular-nums; }
-    .hud {
-      position: fixed;
-      bottom: 10px;
-      left: 10px;
-      background: rgba(4,7,15,.94);
-      color: #00f0ff;
-      font: 600 11px/1.8 ui-monospace, Consolas, "Cascadia Mono", monospace;
-      letter-spacing: 1px;
-      padding: 0 12px;
-      border-radius: 2px;
-      border: 1px solid rgba(0,240,255,.5);
-      box-shadow: 0 0 12px rgba(0,240,255,.3);
-      pointer-events: none;
-    }
-  `;
+  style.textContent = overlayStyles;
   overlayRoot.appendChild(style);
   document.documentElement.appendChild(host);
   return overlayRoot;
+}
+
+/** @param {HTMLElement} host @returns {HTMLElement} */
+function createBadge(host) {
+  if (!nativeAnchorPositioning) {
+    const badge = document.createElement('div');
+    ensureOverlay().appendChild(badge);
+    return badge;
+  }
+
+  const anchorName = `--aid-${pageId}-${++nativeAnchorSeq}`;
+  const previousInlineAnchorNames = host.style.getPropertyValue('anchor-name');
+  const previousInlinePriority = host.style.getPropertyPriority('anchor-name');
+  const computedAnchorNames = getComputedStyle(host).getPropertyValue('anchor-name').trim();
+  const assignedAnchorNames =
+    computedAnchorNames && computedAnchorNames !== 'none'
+      ? `${computedAnchorNames}, ${anchorName}`
+      : anchorName;
+  host.style.setProperty('anchor-name', assignedAnchorNames, 'important');
+
+  const wrapper = document.createElement('div');
+  wrapper.style.setProperty('all', 'initial', 'important');
+  wrapper.style.setProperty('position', 'absolute', 'important');
+  wrapper.style.setProperty('position-anchor', anchorName, 'important');
+  wrapper.style.setProperty('left', 'anchor(left)', 'important');
+  wrapper.style.setProperty('top', 'anchor(top)', 'important');
+  wrapper.style.setProperty('width', '0', 'important');
+  wrapper.style.setProperty('height', '0', 'important');
+  wrapper.style.setProperty('overflow', 'visible', 'important');
+  wrapper.style.setProperty('pointer-events', 'none', 'important');
+  wrapper.style.setProperty('z-index', '2147483647', 'important');
+
+  const root = wrapper.attachShadow({ mode: 'closed' });
+  const style = document.createElement('style');
+  // The native wrapper owns positioning; the shadow child only paints UI.
+  style.textContent = `${overlayStyles}\n.badge { position: static; display: block; }`;
+  const badge = document.createElement('div');
+  root.append(style, badge);
+  const scrollContainer = scrollContainerFor(host);
+  const positionLease = acquireScrollContainerPosition(scrollContainer);
+  scrollContainer.appendChild(wrapper);
+  nativeBadgeBindings.set(badge, {
+    wrapper,
+    host,
+    anchorName,
+    assignedAnchorNames,
+    previousInlineAnchorNames,
+    previousInlinePriority,
+    scrollContainer,
+    positionLease,
+  });
+  return badge;
+}
+
+/**
+ * Remove a badge and undo the non-layout anchor marker placed on its image.
+ * @param {ImgState | undefined} state
+ */
+function removeBadge(state) {
+  const badge = state?.badge;
+  if (!badge) return;
+  const binding = nativeBadgeBindings.get(badge);
+  if (!binding) {
+    badge.remove();
+    state.badge = null;
+    return;
+  }
+
+  binding.wrapper.remove();
+  if (binding.positionLease) releaseScrollContainerPosition(binding.scrollContainer);
+  nativeBadgeBindings.delete(badge);
+  const current = binding.host.style.getPropertyValue('anchor-name');
+  if (current === binding.assignedAnchorNames) {
+    if (binding.previousInlineAnchorNames) {
+      binding.host.style.setProperty(
+        'anchor-name',
+        binding.previousInlineAnchorNames,
+        binding.previousInlinePriority,
+      );
+    } else {
+      binding.host.style.removeProperty('anchor-name');
+    }
+  } else {
+    // Preserve a page update made while the badge existed; remove only ours.
+    const remaining = current
+      .split(',')
+      .map((name) => name.trim())
+      .filter((name) => name && name !== binding.anchorName);
+    if (remaining.length > 0) {
+      binding.host.style.setProperty('anchor-name', remaining.join(', '), 'important');
+    } else {
+      binding.host.style.removeProperty('anchor-name');
+    }
+  }
+  state.badge = null;
 }
 
 /** @param {HTMLElement} el @param {ImgState} state */
@@ -220,17 +469,14 @@ function renderBadge(el, state) {
     // Pending work is intentionally silent. Rendering an ellipsis immediately
     // for every candidate turns image search and gallery pages into a field of
     // extension controls, and layered preview images can briefly show several.
-    state.badge?.remove();
-    state.badge = null;
+    removeBadge(state);
     if (openPopover?.state === state) closePopover();
     scheduleBadgeCollisionReconcile();
     return;
   }
 
-  const root = ensureOverlay();
   if (!state.badge) {
-    state.badge = document.createElement('div');
-    root.appendChild(state.badge);
+    state.badge = createBadge(el);
   }
   const b = state.badge;
   b.onclick = null;
@@ -435,11 +681,19 @@ function togglePopover(host, state) {
   positionPopover(host, pop);
 }
 
-/** @param {HTMLElement} host @param {HTMLElement} pop */
+/**
+ * Track the same clamped corner the badge uses, so an open popover stays
+ * attached to its badge instead of drifting off with the image's real corner.
+ * @param {HTMLElement} host @param {HTMLElement} pop
+ */
 function positionPopover(host, pop) {
-  const rect = paintedRect(host);
-  pop.style.left = `${rect.left + 4}px`;
-  pop.style.top = `${rect.top + 22}px`;
+  const anchor = badgeAnchorPoint({
+    rect: paintedRect(host),
+    clip: clipRectFor(host),
+    inset: BADGE_INSET,
+  });
+  pop.style.left = `${anchor.x}px`;
+  pop.style.top = `${anchor.y + POPOVER_DROP}px`;
 }
 
 document.addEventListener(
@@ -496,22 +750,30 @@ function isVisuallyHidden(host) {
  */
 function positionBadge(host, badge) {
   const rect = paintedRect(host);
+  const nativeBinding = nativeBadgeBindings.get(badge);
   if (rect.width <= 0 || rect.height <= 0 || isVisuallyHidden(host)) {
     badge.style.display = 'none';
     return false;
   }
 
-  const anchorX = rect.left + 4;
-  const anchorY = rect.top + 4;
-  const anchorInViewport =
-    anchorX >= 0 && anchorX < window.innerWidth && anchorY >= 0 && anchorY < window.innerHeight;
+  // Anchoring to the image's own corner loses the badge the moment that corner
+  // scrolls off; clamp to the visible intersection so it tracks the edge.
+  const anchor = badgeAnchorPoint({
+    rect,
+    clip: clipRectFor(host, nativeBinding?.scrollContainer),
+    inset: BADGE_INSET,
+    minVisible: BADGE_MIN_VISIBLE,
+  });
+  const anchorX = anchor.x;
+  const anchorY = anchor.y;
   const overlayHost = overlayRoot?.host;
   /** @type {unknown[]} */
   const overlayNodes = [badge];
+  if (nativeBinding) overlayNodes.push(nativeBinding.wrapper);
   if (setupNotice) overlayNodes.push(setupNotice);
   if (openPopover?.el) overlayNodes.push(openPopover.el);
   if (
-    !anchorInViewport ||
+    !anchor.visible ||
     !overlayHost ||
     !isHostTopmostAtPoint(host, document.elementsFromPoint(anchorX, anchorY), overlayHost, overlayNodes)
   ) {
@@ -522,11 +784,22 @@ function positionBadge(host, badge) {
     return false;
   }
   badge.style.display = '';
-  // Keep the overlay in the same viewport coordinate space as the DOMRect.
-  // Adding window.scrollX/Y here makes the badge drift in nested scrollers
-  // such as TikTok's media viewer, where the modal moves but the page does not.
-  badge.style.left = `${rect.left + 4}px`;
-  badge.style.top = `${rect.top + 4}px`;
+  if (nativeBinding) {
+    // Anchor to the element's border box natively, then retain the painted-pixel
+    // offset for object-fit:contain images. While the image is fully visible
+    // these offsets are constant, so Chromium keeps moving the badge on the
+    // compositor and setImportantStyle no-ops; they only change once the image
+    // is clipped, and the scroll listener below refreshes them per frame.
+    const box = host.getBoundingClientRect();
+    const offsetX = anchorX - box.left;
+    const offsetY = anchorY - box.top;
+    setImportantStyle(nativeBinding.wrapper, 'left', `calc(anchor(left) + ${offsetX}px)`);
+    setImportantStyle(nativeBinding.wrapper, 'top', `calc(anchor(top) + ${offsetY}px)`);
+  } else {
+    // Chrome 116-124 fallback: keep DOMRect and overlay in viewport space.
+    badge.style.left = `${anchorX}px`;
+    badge.style.top = `${anchorY}px`;
+  }
 
   // Dev builds report the first badge placement once, so "created but
   // invisible" is distinguishable from "never created" without DevTools
@@ -538,8 +811,8 @@ function positionBadge(host, badge) {
       '[ai-image-detector] first badge placed:',
       JSON.stringify({
         text: badge.textContent,
-        left: badge.style.left,
-        top: badge.style.top,
+        left: Math.round(br.left),
+        top: Math.round(br.top),
         renderedW: Math.round(br.width),
         renderedH: Math.round(br.height),
         hostConnected: badge.isConnected,
@@ -628,7 +901,7 @@ window.addEventListener('resize', repositionAll, { passive: true });
 function sweepOne(id, el) {
   const state = states.get(el);
   if (openPopover?.state === state) closePopover();
-  state?.badge?.remove();
+  removeBadge(state);
   states.delete(el);
   byId.delete(id);
   scheduleBadgeCollisionReconcile();
@@ -712,6 +985,9 @@ function requestScan(el, state) {
   const rect = el.getBoundingClientRect();
   const width = el instanceof HTMLImageElement && el.naturalWidth ? el.naturalWidth : Math.round(rect.width);
   const height = el instanceof HTMLImageElement && el.naturalHeight ? el.naturalHeight : Math.round(rect.height);
+  const priority = isRectInViewport(rect, { width: window.innerWidth, height: window.innerHeight })
+    ? SCAN_PRIORITY_VISIBLE
+    : SCAN_PRIORITY_NEAR;
 
   ensurePort().postMessage({
     type: MSG.SCAN_REQUEST,
@@ -719,6 +995,7 @@ function requestScan(el, state) {
     url: state.url,
     width,
     height,
+    priority,
   });
 }
 
@@ -793,7 +1070,7 @@ function considerImage(img) {
   if (state) {
     // src/srcset changed, epoch advanced (re-enable / model ready), or a
     // previous no-model result should be retried now that weights exist.
-    state.badge?.remove();
+    removeBadge(state);
     byId.delete(state.id);
   }
 
@@ -904,7 +1181,7 @@ function considerBackground(el) {
     return true;
   }
   if (state) {
-    state.badge?.remove();
+    removeBadge(state);
     byId.delete(state.id);
   }
 
@@ -932,12 +1209,32 @@ function considerTarget(el) {
 }
 
 // Viewport-first: scanning is triggered ONLY from intersection callbacks.
+// On-screen images are requested before rootMargin prefetch so they occupy
+// the first fetch/infer slots on a crowded page.
 const io = new IntersectionObserver(
   (entries) => {
+    /** @type {Element[]} */
+    const visible = [];
+    /** @type {Element[]} */
+    const near = [];
     for (const entry of entries) {
-      if (entry.isIntersecting && entry.target instanceof Element) {
-        if (considerTarget(entry.target)) io.unobserve(entry.target);
+      if (!entry.isIntersecting || !(entry.target instanceof Element)) continue;
+      if (
+        isRectInViewport(entry.boundingClientRect, {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        })
+      ) {
+        visible.push(entry.target);
+      } else {
+        near.push(entry.target);
       }
+    }
+    for (const el of visible) {
+      if (considerTarget(el)) io.unobserve(el);
+    }
+    for (const el of near) {
+      if (considerTarget(el)) io.unobserve(el);
     }
   },
   { rootMargin: `${VIEWPORT_MARGIN}px` },
@@ -1014,6 +1311,11 @@ const mo = new MutationObserver((records) => {
 // Boot / teardown
 
 function boot() {
+  if (started) return;
+  started = true;
+  // Wake the service worker and create the offscreen host while the page's
+  // own images are still loading, so the first badge does not wait on WASM.
+  ensurePort();
   observeImages(document.documentElement);
   mo.observe(document.documentElement, {
     childList: true,
@@ -1065,6 +1367,7 @@ function startHud() {
 }
 
 function teardown() {
+  started = false;
   epoch += 1;
   modelGate.reset();
   staleNoModelRetried.clear();
@@ -1072,6 +1375,8 @@ function teardown() {
   closePopover();
   io.disconnect();
   mo.disconnect();
+  port?.disconnect();
+  port = null;
   for (const [id, el] of byId) sweepOne(id, el);
   byId.clear();
   registry.reset();
@@ -1093,6 +1398,7 @@ chrome.storage.local
     const v = got[ENABLED_FLAG];
     enabled = v === undefined ? true : Boolean(v);
     if (enabled) boot();
+    else teardown();
   })
   .catch((err) => {
     // Fail OPEN, never silent. A rejected storage read (orphaned context after

@@ -1,6 +1,6 @@
-/** WASM-only ONNX Runtime engine for the primary Community Forensics model. */
+/** ONNX Runtime engine for the primary Community Forensics model. */
 
-import * as ort from 'onnxruntime-web/wasm';
+import * as ort from 'onnxruntime-web/webgpu';
 import {
   DEFAULT_TILE_AGGREGATION,
   MODEL_INPUT_SIZE,
@@ -38,18 +38,72 @@ function configureWasm() {
   wasmConfigured = true;
 }
 
+/** WebGPU is a latency path. WASM must still clear the accuracy bar alone. */
+export function gpuAvailable() {
+  const nav = /** @type {{gpu?: unknown} | undefined} */ (globalThis.navigator);
+  return Boolean(nav?.gpu);
+}
+
+/**
+ * @param {readonly string[]} executionProviders
+ */
+function sessionOptions(executionProviders) {
+  return {
+    executionProviders: [...executionProviders],
+    executionMode: /** @type {const} */ ('sequential'),
+    graphOptimizationLevel: /** @type {const} */ ('all'),
+  };
+}
+
+/**
+ * Prefer WebGPU when the adapter exists; fall back to WASM if session
+ * creation fails (unsupported INT8 ops, missing JSEP files, blocked GPU).
+ * The fallback copy keeps the original buffer intact if the first attempt
+ * transfers or detaches it.
+ *
+ * @param {ArrayBuffer} bytes
+ */
+async function createSession(bytes) {
+  const wasm = sessionOptions(['wasm']);
+  if (gpuAvailable()) {
+    try {
+      return await ort.InferenceSession.create(bytes.slice(0), sessionOptions(['webgpu', 'wasm']));
+    } catch (err) {
+      console.warn('[ai-image-detector] WebGPU session failed, using WASM:', err);
+    }
+  }
+  return ort.InferenceSession.create(bytes, wasm);
+}
+
+/**
+ * First session.run compiles WASM/WebGPU kernels. Doing it here means the
+ * first real image only pays for fetch + one forward pass.
+ *
+ * @param {ort.InferenceSession} session
+ * @param {string} inputName
+ * @param {string} outputName
+ */
+async function warmupSession(session, inputName, outputName) {
+  const zeros = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
+  const input = new ort.Tensor('float32', zeros, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+  /** @type {ort.Tensor | undefined} */
+  let output;
+  try {
+    const results = await session.run({ [inputName]: input }, [outputName]);
+    output = results[outputName];
+  } finally {
+    input.dispose();
+    output?.dispose();
+  }
+}
+
 /**
  * @param {RuntimeModelEntry} entry
- * @param {File} modelFile
+ * @param {ArrayBuffer} modelBytes
  */
-export async function createOrtEngine(entry, modelFile) {
+export async function createOrtEngine(entry, modelBytes) {
   configureWasm();
-  const bytes = await modelFile.arrayBuffer();
-  const session = await ort.InferenceSession.create(bytes, {
-    executionProviders: ['wasm'],
-    executionMode: 'sequential',
-    graphOptimizationLevel: 'all',
-  });
+  const session = await createSession(modelBytes);
 
   const inputName = entry.input?.name ?? session.inputNames[0];
   const outputName = entry.output?.name ?? session.outputNames[0];
@@ -110,6 +164,13 @@ export async function createOrtEngine(entry, modelFile) {
       input.dispose();
       output?.dispose();
     }
+  };
+
+  try {
+    await warmupSession(session, inputName, outputName);
+  } catch (err) {
+    await session.release();
+    throw err;
   }
 
   return {
