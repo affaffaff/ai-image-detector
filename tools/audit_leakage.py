@@ -202,7 +202,10 @@ def featurize(records: list[dict], root: pathlib.Path, construction: bool = Fals
         if lossy_count is None:
             lossy_count = len(jpeg_steps) + len(webp_steps)
 
-        onehot = [1.0 if record.get("chain") == chain else 0.0 for chain in chains]
+        # The `chains` universe above defaults a missing key to "unknown";
+        # compare with the same default or those rows get an all-zero chain
+        # one-hot instead of chain=unknown -> 1.
+        onehot = [1.0 if record.get("chain", "unknown") == chain else 0.0 for chain in chains]
         onehot += [1.0 if _source_format(record) == fmt else 0.0 for fmt in source_formats]
         onehot += [1.0 if _output_format(record) == fmt else 0.0 for fmt in output_formats]
         rows.append(onehot + [

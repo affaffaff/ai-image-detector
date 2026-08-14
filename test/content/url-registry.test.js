@@ -17,6 +17,14 @@ describe('UrlRegistry: one request per URL', () => {
     assert.deepEqual([...waiters].sort(), ['i1', 'i2', 'i3']);
   });
 
+  test('reports the request owner so a duplicate can promote the shared job', () => {
+    const reg = new UrlRegistry(10);
+    reg.join('a.png', 'requester');
+    reg.join('a.png', 'duplicate');
+    assert.equal(reg.requestIdFor('a.png'), 'requester');
+    assert.equal(reg.requestIdFor('missing.png'), null);
+  });
+
   test('settling clears the entry so the next request is sent again', () => {
     const reg = new UrlRegistry(10);
     reg.join('a.png', 'i1');

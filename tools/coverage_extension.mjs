@@ -275,7 +275,10 @@ async function recordEligibleCandidates(cdp, sessionId) {
           ...eligibleImages.map((item) => item.element),
           ...eligibleBackgrounds,
         ];
+        let finished = false;
         const finish = () => {
+          if (finished) return;
+          finished = true;
           observer.disconnect();
           const currentImageItems = eligibleImages.filter((item) => intersecting.has(item.element));
           const currentBackgroundItems = eligibleBackgrounds.filter((element) => intersecting.has(element));
@@ -300,14 +303,29 @@ async function recordEligibleCandidates(cdp, sessionId) {
             currentImageSamples: currentImageItems.map((item) => item.sample),
           });
         };
+        const reported = new Set();
         const observer = new IntersectionObserver(
           (entries) => {
-            for (const entry of entries) if (entry.isIntersecting) intersecting.add(entry.target);
+            for (const entry of entries) {
+              reported.add(entry.target);
+              if (entry.isIntersecting) intersecting.add(entry.target);
+            }
+            // Every observed target queues exactly one initial entry. Finish
+            // only once all have reported: the old fixed 50ms timer could
+            // fire before a stalled rendering step delivered ANY callback
+            // (heavy pages do inference on the main thread), silently
+            // recording zero eligible candidates.
+            if (reported.size >= candidates.length) finish();
           },
           { rootMargin: '500px' },
         );
+        if (candidates.length === 0) {
+          finish();
+          return;
+        }
         for (const candidate of candidates) observer.observe(candidate);
-        setTimeout(finish, 50);
+        // Backstop for a target that never reports (e.g. detached mid-wait).
+        setTimeout(finish, 2000);
       })`,
       awaitPromise: true,
       returnByValue: true,
@@ -372,6 +390,7 @@ for (const site of sites) {
   console.error(`[coverage] ${site.name}: ${site.url}`);
   const failures = [];
   const scannerFrames = [];
+  const badgePlacements = [];
   const target = await cdp.send('Target.createTarget', { url: 'about:blank' });
   const attached = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
   const sessionId = attached.sessionId;
@@ -380,6 +399,9 @@ for (const site of sites) {
     if (message.sessionId !== sessionId) return;
     const args = (message.params?.args ?? []).map(remoteValue);
     if (args[0]?.startsWith('[ai-image-detector] scanner active')) scannerFrames.push(args.join(' '));
+    if (args[0]?.startsWith('[ai-image-detector] first badge placed:')) {
+      badgePlacements.push(args[1] ?? 'placed');
+    }
     if (!args[0]?.startsWith('[ai-image-detector] image could not be analyzed:')) return;
     failures.push({
       category: classifyFailure(args[1] ?? ''),
@@ -428,6 +450,8 @@ for (const site of sites) {
     navigationError,
     scannerActive: scannerFrames.length > 0,
     scannerFrames: scannerFrames.length,
+    visibleBadgeObserved: badgePlacements.length > 0,
+    firstBadgePlacement: badgePlacements[0] ?? null,
     domImages: page.images ?? null,
     eligibleTopFrameNow: eligible ? eligible.currentImages + eligible.currentBackgrounds : null,
     eligibleTopFrameSeen: eligible?.seenTotal ?? null,

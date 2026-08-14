@@ -33,6 +33,12 @@ score is uploaded to a detector service—there is no detector service.
 > curve remains quarantined because the frozen native-format nuisance battery
 > fails; publication and hosted checks therefore cannot proceed.
 
+## Personal use
+
+User may not require a score overlay. Leave **Detection** on and
+turn on **Blur AI images** seems to be a good fit for day-to-today usage.
+The page stays visually quiet that way. The numbered badges remain the forensic UI for inspection and evaluation.
+
 ---
 
 ## How it works

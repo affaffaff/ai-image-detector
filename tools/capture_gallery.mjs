@@ -13,7 +13,7 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -60,7 +60,27 @@ const server = createServer((req, res) => {
     res.end(demoPage);
     return;
   }
-  const file = join(root, 'gallery', decodeURIComponent(url.pathname));
+  /** @type {string} */
+  let pathname;
+  try {
+    // Malformed percent-encoding makes decodeURIComponent throw URIError;
+    // without this catch one bad request crashed the capture run.
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    res.writeHead(400);
+    res.end('bad request');
+    return;
+  }
+  const galleryRoot = join(root, 'gallery');
+  const file = normalize(join(galleryRoot, pathname));
+  // Containment: join() collapses `..`, so `/../../x` would otherwise escape
+  // the gallery. Bare startsWith also admits SIBLING paths (`gallery-evil`),
+  // so require the separator.
+  if (file !== galleryRoot && !file.startsWith(galleryRoot + sep)) {
+    res.writeHead(403);
+    res.end('forbidden');
+    return;
+  }
   try {
     const data = readFileSync(file);
     res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });

@@ -113,7 +113,10 @@ async function verifyAndInstall(entry, dir, partHandle) {
 
 /** @param {string | null} value */
 function contentRange(value) {
-  const match = value?.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  // Some CDNs/proxies pad the header with whitespace; a strict anchored match
+  // then failed and permanently killed a resumable download with "invalid
+  // Content-Range".
+  const match = value?.trim().match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
   if (!match) return null;
   return {
     start: Number(match[1]),
@@ -124,7 +127,7 @@ function contentRange(value) {
 
 /** @param {string | null} value */
 function unsatisfiedRangeTotal(value) {
-  const match = value?.match(/^bytes\s+\*\/(\d+)$/i);
+  const match = value?.trim().match(/^bytes\s+\*\/(\d+)$/i);
   return match ? Number(match[1]) : null;
 }
 

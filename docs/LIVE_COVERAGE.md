@@ -10,6 +10,8 @@ decide real-world coverage:
   `cache: 'force-cache'`;
 - the streaming byte cap, image decode, service-worker routing, per-URL
   memoization, and badge completion;
+- an actual visible badge placement, so a page-layering bug cannot pass merely
+  because inference completed behind a hidden overlay;
 - failure categories by CDN host, without retaining complete image URLs.
 
 The dev mock is used only in place of the last ONNX call. This keeps a large

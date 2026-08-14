@@ -1,6 +1,6 @@
 {
   "name": "ai-image-detector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MV3 Chrome extension that detects AI-generated images fully in-browser. No cloud, no telemetry — every image is analyzed on-device.",
   "private": true,
   "type": "module",

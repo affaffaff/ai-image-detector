@@ -6,7 +6,7 @@
 
 import { createServer } from 'node:http';
 import { readFileSync, statSync } from 'node:fs';
-import { extname, join, normalize } from 'node:path';
+import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -38,11 +38,22 @@ const MIME = {
 };
 
 const server = createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  let path = decodeURIComponent(url.pathname);
+  /** @type {string} */
+  let path;
+  try {
+    // Malformed percent-encoding makes decodeURIComponent throw URIError —
+    // without this catch one bad request crashed the whole preview server.
+    path = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname);
+  } catch {
+    res.writeHead(400);
+    res.end('bad request');
+    return;
+  }
   if (path === '/' || path === '') path = '/index.html';
   const file = normalize(join(galleryRoot, path));
-  if (!file.startsWith(galleryRoot)) {
+  // Bare startsWith also admits SIBLING paths like `gallery-evil/...`, because
+  // `...\gallery-evil` starts with `...\gallery`. Require the separator.
+  if (file !== galleryRoot && !file.startsWith(galleryRoot + sep)) {
     res.writeHead(403);
     res.end('forbidden');
     return;

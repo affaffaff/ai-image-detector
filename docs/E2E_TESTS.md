@@ -2,7 +2,11 @@
 
 `tools/smoke_extension.mjs` drives a real Chromium extension through the
 DevTools Protocol. It injects a 384px image into a normal HTTPS page and checks
-the complete path from discovery to the isolated overlay badge.
+the complete path from discovery to the isolated overlay badge. The fixture
+also places a transparent, absolutely positioned sibling link over the image,
+matching the interaction-layer pattern used by X/Twitter and other social
+feeds. A run passes only when the badge remains visibly placed above that
+same-visual link.
 
 The smoke test also calls the inference host directly and verifies that the
 page badge matches the shipped calibration curve. For memoizable HTTP(S)

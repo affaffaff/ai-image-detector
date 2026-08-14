@@ -26,6 +26,17 @@ import { MonotoneCalibrator, clampProb, PROB_EPS } from './calibration.js';
 export const DECISION_THRESHOLD = 0.65;
 
 /**
+ * Default clamp on |L|. Limits how far correlated signals can stack into false
+ * certainty.
+ *
+ * Exported because it also bounds the range of probabilities the pipeline can
+ * ever report — with a single detector signal, nothing can land outside
+ * [fusedCalibrator(σ(−8)), fusedCalibrator(σ(+8))]. The display layer derives
+ * that range from this value rather than hardcoding the endpoints.
+ */
+export const DEFAULT_MAX_ABS_LOG_ODDS = 8;
+
+/**
  * @param {number} p
  * @returns {number}
  */
@@ -88,7 +99,7 @@ export function fuse(signals, cfg) {
     signals: signalCfg,
     prior = 0.5,
     fusedCalibrator,
-    maxAbsLogOdds = 8,
+    maxAbsLogOdds = DEFAULT_MAX_ABS_LOG_ODDS,
   } = cfg;
 
   if (!(fusedCalibrator instanceof MonotoneCalibrator)) {

@@ -239,6 +239,109 @@ export function resetImageObservation(observer, image) {
 }
 
 /**
+ * Attribute mutations that must reset IntersectionObserver.
+ *
+ * `<img>` only resets on `src`/`srcset`. class/style hover churn on a search
+ * grid would otherwise re-enter considerImage for every tile, on the same
+ * main thread the page scrolls on. Background candidates still reset on
+ * class/style so a CSS swap that paints `url()` is not missed. `href` never
+ * resets; search-thumb upgrades are a separate retry.
+ *
+ * @param {boolean} isImage
+ * @param {string | null} attributeName
+ * @returns {boolean}
+ */
+export function attributeResetsObservation(isImage, attributeName) {
+  if (isImage) return attributeName === 'src' || attributeName === 'srcset';
+  return attributeName === 'class' || attributeName === 'style';
+}
+
+const OVERFLOW_SCROLLS = /(auto|scroll|overlay)/;
+
+/**
+ * Whether CSS overflow on an ancestor can scroll (even if it is not
+ * overflowing yet). Sticky/fixed preview panes often start `overflow:auto`
+ * before their content is taller than the pane.
+ *
+ * @param {string} overflowX
+ * @param {string} overflowY
+ * @returns {boolean}
+ */
+export function overflowCanScroll(overflowX, overflowY) {
+  return OVERFLOW_SCROLLS.test(overflowX) || OVERFLOW_SCROLLS.test(overflowY);
+}
+
+/**
+ * Whether this ancestor should host native overlay wrappers.
+ * Sticky/fixed panes with overflow:auto count even before they overflow —
+ * waiting for scrollHeight > clientHeight leaves overlays `position:fixed`
+ * on the document, which then detach when the pane's own scrollbar moves.
+ *
+ * @param {{
+ *   overflowX: string,
+ *   overflowY: string,
+ *   scrollWidth: number,
+ *   clientWidth: number,
+ *   scrollHeight: number,
+ *   clientHeight: number,
+ *   position: string,
+ *   treatAsScroller?: boolean,
+ * }} input
+ * @returns {boolean}
+ */
+export function overflowParentIsScroller(input) {
+  if (!overflowCanScroll(input.overflowX, input.overflowY)) return false;
+  if (input.position === 'fixed' || input.position === 'sticky' || input.treatAsScroller) {
+    return true;
+  }
+  return (
+    (OVERFLOW_SCROLLS.test(input.overflowY) && input.scrollHeight > input.clientHeight) ||
+    (OVERFLOW_SCROLLS.test(input.overflowX) && input.scrollWidth > input.clientWidth)
+  );
+}
+
+/**
+ * Shrink a clip rectangle by sticky/fixed page chrome that does not contain
+ * the image. A header covering the top of the viewport raises `clip.top`; a
+ * right-hand preview pane lowers `clip.right`. Full-viewport click catchers
+ * and corner widgets are ignored so they cannot eat the whole overlay area.
+ *
+ * @param {{left: number, top: number, right: number, bottom: number}} clip
+ * @param {{left: number, top: number, right: number, bottom: number}} occluder
+ * @returns {{left: number, top: number, right: number, bottom: number}}
+ */
+export function insetClipForOccluder(clip, occluder) {
+  const clipW = clip.right - clip.left;
+  const clipH = clip.bottom - clip.top;
+  if (!(clipW > 0 && clipH > 0)) return clip;
+  const overlapW = Math.max(
+    0,
+    Math.min(clip.right, occluder.right) - Math.max(clip.left, occluder.left),
+  );
+  const overlapH = Math.max(
+    0,
+    Math.min(clip.bottom, occluder.bottom) - Math.max(clip.top, occluder.top),
+  );
+  if (!(overlapW > 0 && overlapH > 0)) return clip;
+  if (overlapW >= clipW * 0.95 && overlapH >= clipH * 0.95) return clip;
+
+  const next = { left: clip.left, top: clip.top, right: clip.right, bottom: clip.bottom };
+  if (occluder.top <= clip.top + 1 && occluder.bottom < clip.top + clipH * 0.5 && overlapW >= clipW * 0.5) {
+    next.top = Math.max(next.top, occluder.bottom);
+  }
+  if (occluder.bottom >= clip.bottom - 1 && occluder.top > clip.bottom - clipH * 0.5 && overlapW >= clipW * 0.5) {
+    next.bottom = Math.min(next.bottom, occluder.top);
+  }
+  if (occluder.left <= clip.left + 1 && occluder.right < clip.left + clipW * 0.5 && overlapH >= clipH * 0.5) {
+    next.left = Math.max(next.left, occluder.right);
+  }
+  if (occluder.right >= clip.right - 1 && occluder.left >= clip.left + clipW * 0.4 && overlapH >= clipH * 0.5) {
+    next.right = Math.min(next.right, occluder.left);
+  }
+  return next;
+}
+
+/**
  * Whether a painted box intersects the viewport (no rootMargin). Used to
  * give on-screen images infer-queue priority over prefetch candidates.
  *
@@ -251,10 +354,42 @@ export function isRectInViewport(rect, viewport) {
 }
 
 /**
- * Page overlays communicate completed verdicts only. A pending scan is an
- * implementation detail; rendering an ellipsis for every visible candidate
- * covers image-heavy pages in controls and exposes duplicate viewer layers
- * before they can be reconciled.
+ * Stable, user-focused order for candidates that are already on screen.
+ * Larger visible regions go first, followed by the candidate nearest the
+ * viewport centre and finally normal reading order. IntersectionObserver entry
+ * order is browser scheduling detail and must not decide which image gets the
+ * serialized inference slot first.
+ *
+ * @param {{top: number, left: number, bottom: number, right: number}} a
+ * @param {{top: number, left: number, bottom: number, right: number}} b
+ * @param {{width: number, height: number}} viewport
+ * @returns {number}
+ */
+export function compareViewportCandidates(a, b, viewport) {
+  /** @param {{top: number, left: number, bottom: number, right: number}} rect */
+  const visibleArea = (rect) => {
+    const width = Math.max(0, Math.min(rect.right, viewport.width) - Math.max(rect.left, 0));
+    const height = Math.max(0, Math.min(rect.bottom, viewport.height) - Math.max(rect.top, 0));
+    return width * height;
+  };
+  const areaDifference = visibleArea(b) - visibleArea(a);
+  if (areaDifference !== 0) return areaDifference;
+
+  const viewportX = viewport.width / 2;
+  const viewportY = viewport.height / 2;
+  /** @param {{top: number, left: number, bottom: number, right: number}} rect */
+  const centreDistance = (rect) => {
+    const x = (Math.max(rect.left, 0) + Math.min(rect.right, viewport.width)) / 2;
+    const y = (Math.max(rect.top, 0) + Math.min(rect.bottom, viewport.height)) / 2;
+    return (x - viewportX) ** 2 + (y - viewportY) ** 2;
+  };
+  return centreDistance(a) - centreDistance(b) || a.top - b.top || a.left - b.left;
+}
+
+/**
+ * A compact pending badge makes scan progress deterministic and immediate;
+ * the same node is updated in place when the verdict arrives. Collision
+ * reconciliation removes duplicate viewer layers before paint settles.
  *
  * @param {string} phase
  * @param {unknown} probability
@@ -262,6 +397,7 @@ export function isRectInViewport(rect, viewport) {
  * @returns {boolean}
  */
 export function shouldRenderBadge(phase, probability, inNestedFrame = false) {
+  if (phase === 'pending') return true;
   if (phase === 'scored' && typeof probability === 'number' && Number.isFinite(probability)) {
     return true;
   }
@@ -282,12 +418,137 @@ export function shouldRenderBadge(phase, probability, inNestedFrame = false) {
  * @param {{contains(node: unknown): boolean}[]} hitStack
  * @param {unknown} overlayHost
  * @param {unknown[]} [overlayNodes]
+ * @param {(element: unknown) => boolean} [isAssociatedOverlay]
  * @returns {boolean}
  */
-export function isHostTopmostAtPoint(host, hitStack, overlayHost, overlayNodes = []) {
+export function isHostTopmostAtPoint(
+  host,
+  hitStack,
+  overlayHost,
+  overlayNodes = [],
+  isAssociatedOverlay = () => false,
+) {
   const skip = new Set(overlayNodes);
   const top = hitStack.find((element) => element !== overlayHost && !skip.has(element));
-  return Boolean(top && (top === host || host.contains(top) || top.contains(host)));
+  return Boolean(
+    top && (top === host || host.contains(top) || top.contains(host) || isAssociatedOverlay(top)),
+  );
+}
+
+/**
+ * Whether an element painted above an image's badge anchor is page-layer UI
+ * rather than part of the image's own tile.
+ *
+ * Badges paint on a layer above the page so tile overlays (covering links,
+ * captions, scrims) cannot swallow a finished score. That backfires when the
+ * page opens its own layer — a search autocomplete menu, a dialog, a lightbox
+ * backdrop: the image is covered but the badge still paints, floating in
+ * empty space as if it belonged to the menu. Tile overlays live INSIDE the
+ * image's element box (a covering <a> matches it, captions sit within it);
+ * page layers spill past it. An occluder that extends beyond the host's
+ * border box is not part of the tile, so the badge hides with its image —
+ * the badge behaves as if it sat on the same layer as the picture.
+ *
+ * Compare against the element box, not the painted (object-fit) rect: a
+ * letterboxed covering link extends past the painted pixels yet is still the
+ * image's own interaction layer.
+ *
+ * @param {{left: number, top: number, right: number, bottom: number}} hostBox
+ * @param {{left: number, top: number, right: number, bottom: number}} occluderBox
+ * @param {number} [margin]
+ * @returns {boolean}
+ */
+export function isPageLayerOccluder(hostBox, occluderBox, margin = 4) {
+  return (
+    occluderBox.left < hostBox.left - margin ||
+    occluderBox.top < hostBox.top - margin ||
+    occluderBox.right > hostBox.right + margin ||
+    occluderBox.bottom > hostBox.bottom + margin
+  );
+}
+
+/**
+ * Hide a badge when viewport chrome or a page layer covers its anchor.
+ *
+ * The old rule was "hide unless the image itself is the topmost hit". Card
+ * captions, gradient scrims, and covering <a> layers fail that test even
+ * though they are part of the same picture, so a finished scan never painted
+ * its score. Keep the label unless the occluder is `fixed`/`sticky` chrome
+ * (headers, cookie banners) or page-layer UI that spills past the image's own
+ * box (autocomplete menus, dialogs) — both cover the image while the badge
+ * would keep painting one layer above, detached from the hidden picture.
+ *
+ * @param {boolean} hostIsTopmost
+ * @param {string} [occluderPosition]
+ * @param {boolean} [pageLayerOccludes]
+ * @returns {boolean}
+ */
+export function shouldHideBadgeForOccluder(
+  hostIsTopmost,
+  occluderPosition = '',
+  pageLayerOccludes = false,
+) {
+  if (hostIsTopmost) return false;
+  if (occluderPosition === 'fixed' || occluderPosition === 'sticky') return true;
+  return pageLayerOccludes;
+}
+
+/**
+ * Whether an element above an image is a local interaction layer for that same
+ * painted visual. Social feeds commonly place an empty, absolutely positioned
+ * link over the media instead of wrapping the <img> (X/Twitter is one example).
+ * A DOM-containment-only hit test mistakes that link for unrelated page chrome
+ * and hides an otherwise completed badge.
+ *
+ * The geometry and ancestry limits distinguish those media links from sticky
+ * headers and modal/cookie overlays: the layer must nearly match the image,
+ * share a close visual container, and must not be viewport-fixed.
+ *
+ * @param {Object} input
+ * @param {{left: number, top: number, right: number, bottom: number}} input.hostRect
+ * @param {{left: number, top: number, right: number, bottom: number}} input.overlayRect
+ * @param {number} input.hostAncestorDistance
+ * @param {number} input.overlayAncestorDistance
+ * @param {string} input.position
+ * @returns {boolean}
+ */
+export function isSameVisualInteractionOverlay(input) {
+  if (input.position === 'fixed' || input.position === 'sticky') return false;
+  if (input.hostAncestorDistance > 4 || input.overlayAncestorDistance > 2) return false;
+
+  const hostWidth = Math.max(0, input.hostRect.right - input.hostRect.left);
+  const hostHeight = Math.max(0, input.hostRect.bottom - input.hostRect.top);
+  const overlayWidth = Math.max(0, input.overlayRect.right - input.overlayRect.left);
+  const overlayHeight = Math.max(0, input.overlayRect.bottom - input.overlayRect.top);
+  const hostArea = hostWidth * hostHeight;
+  const overlayArea = overlayWidth * overlayHeight;
+  if (!(hostArea > 0 && overlayArea > 0)) return false;
+
+  const intersectionWidth = Math.max(
+    0,
+    Math.min(input.hostRect.right, input.overlayRect.right) -
+      Math.max(input.hostRect.left, input.overlayRect.left),
+  );
+  const intersectionHeight = Math.max(
+    0,
+    Math.min(input.hostRect.bottom, input.overlayRect.bottom) -
+      Math.max(input.hostRect.top, input.overlayRect.top),
+  );
+  // Intersection over the larger area rejects narrow toolbars that happen to
+  // sit wholly inside a large image (smaller-area overlap would call that 1).
+  return (intersectionWidth * intersectionHeight) / Math.max(hostArea, overlayArea) >= 0.85;
+}
+
+/**
+ * Right-hand image-search viewer (Google Images pane, Bing detail column).
+ * Related-strip thumbs in that column are smaller than 160px.
+ *
+ * @param {{left: number, width: number, height: number}} box
+ * @param {number} viewportWidth
+ * @returns {boolean}
+ */
+export function isPreviewPaneBox(box, viewportWidth) {
+  return box.left > viewportWidth * 0.45 && Math.min(box.width, box.height) > 160;
 }
 
 /**

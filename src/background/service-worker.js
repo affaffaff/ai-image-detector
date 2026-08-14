@@ -11,15 +11,21 @@
  *    one place means one code path to audit for the calibration order.
  */
 
-import { fuse, DECISION_THRESHOLD } from '../fusion/fuse.js';
+import { fuse, DECISION_THRESHOLD, logit } from '../fusion/fuse.js';
 import { MonotoneCalibrator, IDENTITY_CALIBRATOR } from '../fusion/calibration.js';
+import { applyGraphicCap } from '../shared/graphic-gate.js';
+import { applyNativeTileVeto } from '../shared/native-veto.js';
+import { displayPercent, reportableRange } from '../shared/display-score.js';
 import { MSG, PORT_SCAN, TARGET } from '../shared/messages.js';
 import {
+  BLUR_AI_FLAG,
   DEV_MOCK_DEFAULT,
   DEV_MOCK_FLAG,
   ENABLED_FLAG,
   SCAN_MEMO_MAX,
   SCAN_PRIORITY_NEAR,
+  enabledFromStorage,
+  readStoredFlag,
 } from '../shared/constants.js';
 import { isSessionMemoizableUrl } from '../shared/inline-payload.js';
 
@@ -63,7 +69,7 @@ async function ensureOffscreen() {
 // the identity calibrator keeps the pipeline runnable — that state is a
 // BRING-UP state, warned loudly, never a production configuration.
 
-/** @type {{signals: Record<string, {calibrator: MonotoneCalibrator, weight: number}>, fusedCalibrator: MonotoneCalibrator} | null} */
+/** @type {{signals: Record<string, {calibrator: MonotoneCalibrator, weight: number}>, fusedCalibrator: MonotoneCalibrator, displayRange: {min: number, max: number}} | null} */
 let fusionCfg = null;
 
 /** @param {string} path */
@@ -87,11 +93,15 @@ async function loadFusionConfig() {
         'Scores are NOT placed on the 0.65 boundary. Do not evaluate accuracy in this state.',
     );
   }
+  const fusedCalibrator = fusedCal ?? IDENTITY_CALIBRATOR;
   fusionCfg = {
     signals: {
       detector: { calibrator: detectorCal ?? IDENTITY_CALIBRATOR, weight: 1 },
     },
-    fusedCalibrator: fusedCal ?? IDENTITY_CALIBRATOR,
+    fusedCalibrator,
+    // Derived from the curve that just loaded, so a refit moves the badge
+    // scale with it. See src/shared/display-score.js.
+    displayRange: reportableRange(fusedCalibrator),
   };
   return fusionCfg;
 }
@@ -109,23 +119,48 @@ async function loadFusionConfig() {
 let memoCache = null;
 /** @type {Promise<ScanMemo> | null} */
 let memoLoad = null;
-let scanningEnabled = true;
+/**
+ * False until chrome.storage has answered, so a worker that woke for a new
+ * tab cannot scan with the first-run default while Detection is actually off.
+ */
+let scanningEnabled = false;
+/** Set when a live ENABLED_SETTING / storage change arrives, so a stale initial get cannot turn it back on. */
+let receivedLiveEnabled = false;
+/** Bumped when Detection turns off so in-flight scanOne results are dropped. */
+let scanEpoch = 0;
+/**
+ * Viewport promotions that arrived before `INFER_RUN` was keyed. Without this,
+ * `reprioritize` is a no-op and the job keeps the prefetch rank.
+ * Bounded: entries are consumed by takeScanPriority when the scan is sent, but
+ * a scan that ends early (memo hit, Detection off) or a priority update that
+ * arrives after its request never is — on an infinite feed that is one stale
+ * entry per image for the life of the worker.
+ * @type {Map<string, number>}
+ */
+const pendingScanPriority = new Map();
+/** Hard bound on stale promotions; Map order is insertion order. */
+const PENDING_SCAN_PRIORITY_MAX = 1000;
 /** @type {boolean | null} */
 let allowMockCache = null;
 
-void chrome.storage.local.get([ENABLED_FLAG, DEV_MOCK_FLAG]).then((got) => {
-  const enabled = got[ENABLED_FLAG];
-  scanningEnabled = enabled === undefined ? true : Boolean(enabled);
-  const mockSetting = got[DEV_MOCK_FLAG];
-  allowMockCache =
-    __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
-}).catch(() => {});
+const settingsReady = chrome.storage.local
+  .get([ENABLED_FLAG, DEV_MOCK_FLAG])
+  .then((got) => {
+    const enabled = readStoredFlag(receivedLiveEnabled, got[ENABLED_FLAG], true);
+    if (enabled !== null) scanningEnabled = enabled;
+    const mockSetting = got[DEV_MOCK_FLAG];
+    allowMockCache =
+      __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
+  })
+  .catch(() => {
+    if (!receivedLiveEnabled) scanningEnabled = true;
+  });
 
 chrome.storage.onChanged?.addListener((changes, area) => {
   if (area !== 'local') return;
-  if (ENABLED_FLAG in changes) {
-    const v = changes[ENABLED_FLAG]?.newValue;
-    scanningEnabled = v === undefined ? true : Boolean(v);
+  if (ENABLED_FLAG in changes && !receivedLiveEnabled) {
+    scanningEnabled = enabledFromStorage(changes[ENABLED_FLAG]?.newValue);
+    if (!scanningEnabled) stopScanning();
   }
   if (DEV_MOCK_FLAG in changes) {
     const mockSetting = changes[DEV_MOCK_FLAG]?.newValue;
@@ -221,24 +256,99 @@ async function scanCountEnsure() {
   return scanCountLoad;
 }
 
+/**
+ * Increments chain through this promise so concurrent scanOne completions
+ * cannot read the same count and both write current + 1.
+ * @type {Promise<void>}
+ */
+let scanCountWrite = Promise.resolve();
+
 function scanCountIncrement() {
-  const write = async () => {
-    const current = await scanCountEnsure();
-    scanCountCache = current + 1;
-    await chrome.storage.session.set({ scanCount: scanCountCache });
-  };
-  void write().catch(() => {});
+  scanCountWrite = scanCountWrite
+    .then(async () => {
+      const current = await scanCountEnsure();
+      scanCountCache = current + 1;
+      await chrome.storage.session.set({ scanCount: scanCountCache });
+    })
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
 // Scan pipeline
 
-/** @param {ScanRequest} req @returns {Promise<ScanUpdate>} */
-async function scanOne(req) {
+function stopScanning() {
+  scanEpoch += 1;
+  scanningEnabled = false;
+  void chrome.runtime
+    .sendMessage({ type: MSG.INFER_CANCEL, target: TARGET.OFFSCREEN })
+    .catch(() => {
+      /* offscreen document may not exist while Detection is off */
+    });
+}
+
+/** @param {number} epoch */
+function scanningStopped(epoch) {
+  return !scanningEnabled || epoch !== scanEpoch;
+}
+
+/** @param {string | undefined} id @param {number} priority */
+function rememberScanPriority(id, priority) {
+  if (typeof id !== 'string' || !Number.isFinite(priority)) return;
+  const prev = pendingScanPriority.get(id);
+  if (prev == null || priority > prev) pendingScanPriority.set(id, priority);
+  // Evict the oldest promotions past the cap. An entry whose scan request
+  // resolved from the memo (or while disabled) is never consumed by
+  // takeScanPriority, so without a bound the map grows per image scanned.
+  while (pendingScanPriority.size > PENDING_SCAN_PRIORITY_MAX) {
+    const oldest = pendingScanPriority.keys().next();
+    if (oldest.done) break;
+    pendingScanPriority.delete(oldest.value);
+  }
+}
+
+/** @param {ScanRequest} req */
+function takeScanPriority(req) {
+  const boosted = typeof req.id === 'string' ? pendingScanPriority.get(req.id) : undefined;
+  if (typeof req.id === 'string') pendingScanPriority.delete(req.id);
+  const base = typeof req.priority === 'number' ? req.priority : SCAN_PRIORITY_NEAR;
+  return boosted != null && boosted > base ? boosted : base;
+}
+
+/** @param {chrome.runtime.Port} port @param {object} update */
+function postPortUpdate(port, update) {
+  try {
+    port.postMessage({ type: MSG.SCAN_UPDATE, ...update });
+  } catch {
+    /* disconnected */
+  }
+}
+
+/** @param {ScanRequest} req @param {number} epoch @returns {Promise<ScanUpdate>} */
+async function scanOne(req, epoch) {
+  // Early exits never reach takeScanPriority, so consume any parked promotion
+  // here — otherwise every memo-hit or disabled scan strands one map entry.
+  const dropParkedPriority = () => {
+    if (typeof req.id === 'string') pendingScanPriority.delete(req.id);
+  };
+  if (scanningStopped(epoch)) {
+    dropParkedPriority();
+    return { id: req.id, url: req.url, state: 'unscannable', error: 'disabled' };
+  }
   const memoized = await memoGet(req.url);
-  if (memoized) return { ...memoized, id: req.id, url: req.url };
+  if (scanningStopped(epoch)) {
+    dropParkedPriority();
+    return { id: req.id, url: req.url, state: 'unscannable', error: 'disabled' };
+  }
+  if (memoized) {
+    dropParkedPriority();
+    return { ...memoized, id: req.id, url: req.url };
+  }
 
   await ensureOffscreen();
+  if (scanningStopped(epoch)) {
+    dropParkedPriority();
+    return { id: req.id, url: req.url, state: 'unscannable', error: 'disabled' };
+  }
 
   const allowMock =
     allowMockCache ??
@@ -251,8 +361,11 @@ async function scanOne(req) {
     id: req.id,
     url: req.url,
     allowMock,
-    priority: typeof req.priority === 'number' ? req.priority : SCAN_PRIORITY_NEAR,
+    priority: takeScanPriority(req),
   });
+  if (scanningStopped(epoch)) {
+    return { id: req.id, url: req.url, state: 'unscannable', error: 'disabled' };
+  }
 
   if (!result.ok) {
     /** @type {ScanUpdate} */
@@ -265,16 +378,75 @@ async function scanOne(req) {
 
   const cfg = await loadFusionConfig();
   const fused = fuse([{ name: 'detector', raw: /** @type {number} */ (result.raw) }], cfg);
+  let probability = fused.probability;
+  const contributions = fused.contributions.map((c) => ({
+    name: c.name,
+    bits: c.bits,
+    ...(c.reason ? { reason: c.reason } : {}),
+  }));
+
+  // Graphic-content gate: flat vector art / text / charts are outside the
+  // detector's photo-vs-generated training domain, and its confident scores
+  // there are noise. Cap — never boost — the fused probability below the
+  // fixed threshold. A C2PA override is cryptographic evidence and is never
+  // capped (fuse() returns before this on the override path).
+  /** @type {'graphic' | 'native-tiles' | undefined} */
+  let gate;
+  if (fused.path === 'fusion' && result.graphic?.gated) {
+    const capped = applyGraphicCap(probability);
+    if (capped.capped) {
+      // Report the cap in the same log-odds currency as the other rows in
+      // the popover, so the verdict stays auditable. Do not set `gate` when
+      // the fused score was already below the cap — the popover would claim
+      // a cap that did not change the verdict.
+      contributions.push({
+        name: 'graphic-content cap',
+        bits: (logit(capped.probability) - logit(probability)) / Math.LN2,
+      });
+      gate = 'graphic';
+    }
+    probability = capped.probability;
+  }
+
+  // Native-tile veto: the official Resize(440)+CenterCrop can manufacture
+  // generation-like structure when it downscales. If every native 384 crop
+  // still looks real, the official AI score is a resampling artifact — cap
+  // it the same way the graphic gate does. Official-REAL images are never
+  // flipped (rescue was measured and rejected).
+  if (fused.path === 'fusion' && probability >= DECISION_THRESHOLD) {
+    const veto = applyNativeTileVeto({
+      probability,
+      nativeMax: result.nativeMax,
+      nativeMedian: result.nativeMedian,
+      fuseNative: (raw) => cfg.fusedCalibrator.apply(raw),
+    });
+    if (veto.vetoed) {
+      contributions.push({
+        name: 'native-tile veto',
+        bits: (logit(veto.probability) - logit(probability)) / Math.LN2,
+      });
+      probability = veto.probability;
+      gate = 'native-tiles';
+    }
+  }
+  if (scanningStopped(epoch)) {
+    return { id: req.id, url: req.url, state: 'unscannable', error: 'disabled' };
+  }
+  const isAI = probability >= DECISION_THRESHOLD;
 
   /** @type {ScanUpdate} */
   const update = {
     id: req.id,
     url: req.url,
     state: 'scored',
-    probability: fused.probability,
-    isAI: fused.probability >= DECISION_THRESHOLD,
-    engine: result.engine,
-    contributions: fused.contributions.map((c) => ({ name: c.name, bits: c.bits })),
+    probability,
+    display: displayPercent(probability, isAI, cfg.displayRange),
+    isAI,
+    // statsOnly results never reach scanOne; the scan pipeline only ever
+    // produces real or mock verdicts.
+    engine: /** @type {'ort' | 'mock'} */ (result.engine),
+    ...(gate ? { gate } : {}),
+    contributions,
   };
   memoPut(req.url, update);
   scanCountIncrement();
@@ -289,44 +461,62 @@ chrome.runtime.onConnect.addListener((port) => {
 
   // Creating the offscreen host (and therefore starting engine warmup) on
   // connect — not on the first SCAN_REQUEST — overlaps WASM compile with
-  // the page's own image loading.
-  void ensureOffscreen().catch(() => {});
-  void loadFusionConfig().catch(() => {});
-  void memoEnsure().catch(() => {});
+  // the page's own image loading. Skip all of that while Detection is off.
+  void settingsReady.then(() => {
+    if (!scanningEnabled) return;
+    void ensureOffscreen().catch(() => {});
+    void loadFusionConfig().catch(() => {});
+    void memoEnsure().catch(() => {});
+  });
+
+  // A content-script port that dies because its tab entered the back/forward
+  // cache sets lastError here, on this side of the channel. Leaving it unread
+  // is the "Unchecked runtime.lastError" Chrome attributes to the extension.
+  port.onDisconnect.addListener(() => {
+    void chrome.runtime.lastError;
+  });
 
   port.onMessage.addListener(async (msg) => {
+    if (msg?.type === MSG.SCAN_PRIORITY) {
+      await settingsReady.catch(() => {});
+      if (!scanningEnabled) return;
+      rememberScanPriority(msg.id, msg.priority);
+      void ensureOffscreen()
+        .then(() =>
+          chrome.runtime.sendMessage({
+            type: MSG.INFER_PRIORITY,
+            target: TARGET.OFFSCREEN,
+            id: msg.id,
+            priority: msg.priority,
+          }),
+        )
+        .catch(() => {});
+      return;
+    }
     if (msg?.type !== MSG.SCAN_REQUEST) return;
+    await settingsReady.catch(() => {});
     if (!scanningEnabled) {
-      try {
-        port.postMessage({
-          type: MSG.SCAN_UPDATE,
-          id: msg.id,
-          url: msg.url,
-          state: 'unscannable',
-          error: 'disabled',
-        });
-      } catch {
-        /* disconnected */
-      }
+      if (typeof msg.id === 'string') pendingScanPriority.delete(msg.id);
+      postPortUpdate(port, {
+        id: msg.id,
+        url: msg.url,
+        state: 'unscannable',
+        error: 'disabled',
+      });
       return;
     }
 
+    const epoch = scanEpoch;
     try {
-      const update = await scanOne(msg);
-      port.postMessage({ type: MSG.SCAN_UPDATE, ...update });
+      const update = await scanOne(msg, epoch);
+      postPortUpdate(port, update);
     } catch (err) {
-      // Port may already be gone (tab closed) — that is fine.
-      try {
-        port.postMessage({
-          type: MSG.SCAN_UPDATE,
-          id: msg.id,
-          url: msg.url,
-          state: 'unscannable',
-          error: String(err),
-        });
-      } catch {
-        /* disconnected */
-      }
+      postPortUpdate(port, {
+        id: msg.id,
+        url: msg.url,
+        state: 'unscannable',
+        error: scanningStopped(epoch) ? 'disabled' : String(err),
+      });
     }
   });
 });
@@ -361,8 +551,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
       });
       return true;
-    case MSG.MODEL_PROGRESS:
-      // Progress events exist for a future setup UI; popup polls for now.
+    case MSG.ENABLED_SETTING:
+      receivedLiveEnabled = true;
+      // Fanout messages omit `target`. Re-broadcasting those would loop
+      // through every tab while the popup is open and freeze the page.
+      // Persist here: the popup document is destroyed on click-away, which
+      // used to cancel its chrome.storage.local.set.
+      if (msg.target === TARGET.SW) {
+        void persistAndBroadcastEnabled(Boolean(msg.enabled)).then(
+          () => sendResponse({ ok: true }),
+          () => sendResponse({ ok: false }),
+        );
+        return true;
+      }
+      scanningEnabled = Boolean(msg.enabled);
+      if (!scanningEnabled) stopScanning();
+      return false;
+    case MSG.BLUR_SETTING:
+      if (msg.target === TARGET.SW) {
+        void persistAndBroadcastBlur(Boolean(msg.enabled)).then(
+          () => sendResponse({ ok: true }),
+          () => sendResponse({ ok: false }),
+        );
+        return true;
+      }
       return false;
     default:
       return false;
@@ -375,14 +587,55 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 async function notifyModelReady() {
   const message = { type: MSG.MODEL_READY };
+  await fanoutToTabs(message);
+}
+
+/** Dropped when a newer Detection toggle arrives before persist finishes. */
+let enabledWriteGen = 0;
+/** Dropped when a newer Blur toggle arrives before persist finishes. */
+let blurWriteGen = 0;
+
+/** @param {boolean} enabled */
+async function persistAndBroadcastEnabled(enabled) {
+  const gen = ++enabledWriteGen;
+  // Yield so off→on in the same burst keeps only the last value. Cancelling
+  // inference on the off half used to freeze pending images after re-enable.
+  await Promise.resolve();
+  if (gen !== enabledWriteGen) return;
+  scanningEnabled = enabled;
+  if (!enabled) stopScanning();
+  await chrome.storage.local.set({ [ENABLED_FLAG]: enabled });
+  if (gen !== enabledWriteGen) return;
+  await broadcastEnabledSetting(enabled);
+}
+
+/** @param {boolean} enabled */
+async function persistAndBroadcastBlur(enabled) {
+  const gen = ++blurWriteGen;
+  await Promise.resolve();
+  if (gen !== blurWriteGen) return;
+  await chrome.storage.local.set({ [BLUR_AI_FLAG]: enabled });
+  if (gen !== blurWriteGen) return;
+  await broadcastBlurSetting(enabled);
+}
+
+/** @param {boolean} enabled */
+async function broadcastEnabledSetting(enabled) {
+  await fanoutToTabs({ type: MSG.ENABLED_SETTING, enabled });
+}
+
+/** @param {boolean} enabled */
+async function broadcastBlurSetting(enabled) {
+  await fanoutToTabs({ type: MSG.BLUR_SETTING, enabled });
+}
+
+/** @param {object} message */
+async function fanoutToTabs(message) {
   try {
     await chrome.runtime.sendMessage(message);
   } catch {
     /* no extension-page listeners yet */
   }
-  // runtime.sendMessage misses tabs whose content script is not listening yet
-  // (install/startup recovery often wins that race). Fan out per tab so an
-  // already-open page that latched on a transient no-model still recovers.
   if (!chrome.tabs?.query || !chrome.tabs?.sendMessage) return;
   try {
     const tabs = await chrome.tabs.query({});
@@ -452,3 +705,5 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   scheduleModelRecovery('startup');
 });
+
+

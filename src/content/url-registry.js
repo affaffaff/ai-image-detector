@@ -78,6 +78,18 @@ export class UrlRegistry {
   }
 
   /**
+   * Request id that owns the in-flight work for a URL. Duplicate DOM elements
+   * use this id when promoting a now-visible image, so the queue reprioritizes
+   * the one real inference job rather than a waiter that has no job of its own.
+   * @param {string} url
+   * @returns {string | null}
+   */
+  requestIdFor(url) {
+    const first = this.inFlight.get(url)?.values().next();
+    return first && !first.done ? first.value : null;
+  }
+
+  /**
    * URL that currently has this image id waiting, or null.
    * Needed when the requesting element has been removed (infinite scroll)
    * but other images on the same URL are still waiting for the result.

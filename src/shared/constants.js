@@ -26,6 +26,41 @@ export const MIN_IMAGE_EDGE = 64;
 export const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 
 /**
+ * Max decoded image we will analyze (pixels). The byte cap does NOT bound
+ * decoded size: a solid-colour 50000×50000 PNG is a few hundred KB compressed
+ * but 10 GB as RGBA — enough to kill the offscreen document (and every queued
+ * scan with it) before inference ever runs. 100 MP is far above any real web
+ * photograph while keeping worst-case canvas/typed-array allocations ~400 MB.
+ */
+export const MAX_DECODE_PIXELS = 100_000_000;
+
+/**
+ * How many larger-source candidates to probe per image before giving up and
+ * scanning what the page rendered. Each probe is a real image load.
+ */
+export const UPGRADE_PROBE_LIMIT = 3;
+
+/** Deadline on probing one upgrade candidate (ms). */
+export const UPGRADE_PROBE_TIMEOUT_MS = 6_000;
+
+/**
+ * Concurrent larger-source probes. Each probe constructs an `Image` in the
+ * page process (intrinsic size only — no pixels are read). Unbounded, a
+ * search grid would decode dozens of originals on the same main thread the
+ * page scrolls on.
+ */
+export const UPGRADE_PROBE_CONCURRENCY = 2;
+
+/**
+ * Tolerance on |ln(candidate aspect / rendered aspect)|.
+ *
+ * The same photograph re-encoded at another size keeps its aspect ratio; a
+ * gallery link pointing at a different photograph usually does not. Generous
+ * enough to absorb a row of rounding on small thumbnails.
+ */
+export const UPGRADE_ASPECT_TOLERANCE = 0.12;
+
+/**
  * Hard deadline on fetching one image's bytes (ms).
  *
  * Load-bearing, not defensive: ONNX itself is serialized (INFER_CONCURRENCY = 1),
@@ -108,3 +143,57 @@ export const DEV_MOCK_DEFAULT = DEV_BUILD;
 
 /** storage.local flag: master enable. Default true. */
 export const ENABLED_FLAG = 'enabled';
+
+/**
+ * Read a boolean chrome.storage value. Missing key is first-run and uses
+ * `fallback`. A stored `false` must stay false — treating `undefined` as
+ * off would disable a fresh install for Detection.
+ * @param {unknown} value
+ * @param {boolean} fallback
+ * @returns {boolean}
+ */
+export function flagFromStorage(value, fallback) {
+  return value === undefined ? fallback : Boolean(value);
+}
+
+/**
+ * A chrome.storage.get that was already in flight when a live update arrived
+ * (popup message, in-UI toggle, or onChanged) must not clobber it.
+ * @param {boolean} liveApplied
+ * @param {unknown} stored
+ * @param {boolean} fallback
+ * @returns {boolean | null} null → keep the live value
+ */
+export function readStoredFlag(liveApplied, stored, fallback) {
+  if (liveApplied) return null;
+  return flagFromStorage(stored, fallback);
+}
+
+/**
+ * Read the master enable flag from chrome.storage. Missing key is first-run
+ * and means on. A stored `false` must stay false — applying `Boolean()`
+ * before the missing-key check would also treat `false` as off, but treating
+ * `undefined` as off would disable a fresh install.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function enabledFromStorage(value) {
+  return flagFromStorage(value, true);
+}
+
+/**
+ * storage.local flag: blur images the detector has already called AI.
+ * Cosmetic only — never part of scoring, fusion, or the 0.65 decision.
+ * Off until the user enables it in the popup; a revealed image stays sharp
+ * until the toggle is flipped again.
+ */
+export const BLUR_AI_FLAG = 'blurAiOptIn';
+export const BLUR_AI_DEFAULT = false;
+
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function blurFromStorage(value) {
+  return flagFromStorage(value, BLUR_AI_DEFAULT);
+}

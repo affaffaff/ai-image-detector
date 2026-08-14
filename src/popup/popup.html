@@ -107,6 +107,13 @@
         box-shadow: 0 0 8px var(--green);
         animation: blink 1.4s ease-in-out infinite;
       }
+      .live.off { color: var(--text-dim); }
+      .live.off i {
+        background: var(--text-dim);
+        box-shadow: none;
+        animation: none;
+        opacity: 0.7;
+      }
       @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
       /* ---------- rows ---------- */
@@ -118,10 +125,18 @@
         margin: 9px 0;
         gap: 8px;
       }
+      .row.toggle { cursor: pointer; }
       .k {
         color: var(--text-dim);
         font-size: 10px;
         letter-spacing: 1.4px;
+      }
+      .hint {
+        margin: -4px 0 8px;
+        color: var(--text-dim);
+        font-size: 9px;
+        letter-spacing: 0.4px;
+        line-height: 1.4;
       }
       .k::before { content: "▸ "; color: var(--cyan-dim); }
 
@@ -205,7 +220,7 @@
 
       /* ---------- cyberpunk toggle ---------- */
       .switch { position: relative; display: inline-block; cursor: pointer; }
-      .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .switch input { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
       .switch .track {
         display: block;
         width: 36px;
@@ -275,17 +290,25 @@
         <span class="logo-box">AI</span>
         <span class="logo-txt">IMAGE DETECTOR<span class="logo-sub">NEURAL FORENSICS // ON-DEVICE</span></span>
       </div>
-      <span class="live"><i></i>LIVE</span>
+      <span class="live" id="live"><i></i><span id="live-label">LIVE</span></span>
     </header>
 
     <div class="main">
-      <div class="row">
+      <div class="row toggle" id="enabled-row" role="switch" aria-checked="true" tabindex="0" title="Enable or disable image scanning">
         <span class="k">Detection</span>
-        <label class="switch" title="Enable or disable image scanning">
-          <input type="checkbox" id="enabled" />
+        <span class="switch">
+          <input type="checkbox" id="enabled" checked tabindex="-1" />
           <span class="track"></span>
-        </label>
+        </span>
       </div>
+      <div class="row toggle" id="blur-row" role="switch" aria-checked="false" tabindex="0" title="When on, images marked AI-generated are blurred. Click a blurred image to show it.">
+        <span class="k">Blur AI images</span>
+        <span class="switch">
+          <input type="checkbox" id="blur-ai" tabindex="-1" />
+          <span class="track"></span>
+        </span>
+      </div>
+      <div class="hint" id="blur-hint">Off. Turn on to hide AI-scored images; click one to reveal it.</div>
       <div class="row">
         <span class="k">Model</span>
         <span class="status" id="model-state">…</span>

@@ -21,6 +21,14 @@ test('inlineDecodedBytes estimates base64 and raw data: payloads', () => {
   assert.equal(inlineDecodedBytes('data:image/png;base64'), Number.POSITIVE_INFINITY);
 });
 
+test('the base64 marker is ASCII case-insensitive per the URL Standard', () => {
+  assert.equal(inlineDecodedBytes('data:image/png;BASE64,AAAA'), 3);
+  assert.equal(inlineDecodedBytes('data:image/png;Base64,AAAA'), 3);
+  assert.equal(inlineDecodedBytes('data:image/png;charset=utf-8;BASE64,AAAA'), 3);
+  // "base64" NOT preceded by ';' is a mediatype substring, not the marker.
+  assert.equal(inlineDecodedBytes('data:base64x/png,abcd'), 4);
+});
+
 test('isInlinePayloadTooLarge honours a caller-supplied cap', () => {
   assert.equal(isInlinePayloadTooLarge('data:image/png;base64,AAAA', 3), false);
   assert.equal(isInlinePayloadTooLarge('data:image/png;base64,AAAA', 2), true);

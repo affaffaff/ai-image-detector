@@ -29,6 +29,10 @@ export function isSessionMemoizableUrl(url) {
 /**
  * Decoded byte length of a data: URL payload, or 0 if `url` is not data:.
  * Malformed data: URLs report Infinity so callers treat them as too large.
+ * The base64 marker is ASCII case-insensitive in the URL Standard
+ * (`;BASE64` decodes identically to `;base64`), so the estimate must be too —
+ * a case-sensitive match overestimates base64 payloads by 4/3 and wrongly
+ * rejects in-limit images.
  * @param {string} url
  */
 export function inlineDecodedBytes(url) {
@@ -37,7 +41,7 @@ export function inlineDecodedBytes(url) {
   if (comma < 0) return Number.POSITIVE_INFINITY;
   const payloadChars = url.length - comma - 1;
   const meta = url.slice(5, comma);
-  return meta.includes(';base64') ? Math.floor((payloadChars * 3) / 4) : payloadChars;
+  return /;base64/i.test(meta) ? Math.floor((payloadChars * 3) / 4) : payloadChars;
 }
 
 /**

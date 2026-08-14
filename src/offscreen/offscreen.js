@@ -20,6 +20,7 @@
 import { MSG, TARGET } from '../shared/messages.js';
 import {
   MAX_IMAGE_BYTES,
+  MAX_DECODE_PIXELS,
   IMAGE_FETCH_TIMEOUT_MS,
   INFER_JOB_TIMEOUT_MS,
   FETCH_CONCURRENCY,
@@ -35,6 +36,7 @@ import {
 } from './download.js';
 import { createOrtEngine } from './ort-engine.js';
 import { createInferQueue } from './infer-queue.js';
+import { bitmapGraphicStats } from './graphic-stats.js';
 
 /** @typedef {import('./download.js').ModelManifestEntry} ModelManifestEntry */
 /** @typedef {import('../shared/messages.js').ModelStatus} ModelStatus */
@@ -54,6 +56,14 @@ let enginePromise = null;
 /** @type {Promise<ModelStatus> | null} */
 let downloadPromise = null;
 
+/**
+ * Distinguishes "the engine cannot run the verified weights" from "a download
+ * attempt failed". Only the former pins the error state: a failed download may
+ * have since completed in OPFS, so its status must be recomputed on the next
+ * poll instead of latching no-model for the rest of the session.
+ */
+let runtimeInitFailed = false;
+
 async function loadManifest() {
   if (manifestEntries) return manifestEntries;
   const res = await fetch(chrome.runtime.getURL('models/manifest.json'));
@@ -72,9 +82,17 @@ async function refreshModelStatus() {
   const entries = await loadManifest();
   const primary = entries[0];
   if (!primary || !primary.url || !primary.sha256) {
+    // Reachable only in a release build, where `url` is deliberately null while
+    // models/calibration/fused.json stays quarantined (the frozen native-format
+    // nuisance battery fails; see its quarantineReason). The state stays even
+    // though a local-model build never hits it: deleting it would leave a
+    // release build silently scoring nothing. Point at the build that works
+    // rather than reporting a dead end.
     modelStatus = {
       state: 'not-configured',
-      detail: 'the verified model artifact has no public setup URL yet',
+      detail:
+        'the verified model artifact has no public setup URL yet. ' +
+        'Build with npm run build:local-model to bundle the local weights.',
     };
     return modelStatus;
   }
@@ -105,6 +123,7 @@ async function runDownload() {
         .catch(() => {});
     });
     enginePromise = null;
+    runtimeInitFailed = false;
     modelStatus = { state: 'ready', modelId: primary.id, modelSha256: primary.sha256 ?? undefined };
     scheduleEngineWarmup();
     return modelStatus;
@@ -132,7 +151,12 @@ function startDownload() {
 
 /** @returns {Promise<ModelStatus>} */
 function currentModelStatus() {
-  if (downloadPromise || modelStatus.state === 'error') return Promise.resolve(modelStatus);
+  if (downloadPromise) return Promise.resolve(modelStatus);
+  // A runtime-init failure stays pinned — the weights verified, the engine is
+  // what is broken, and re-reporting "ready" would restart the failing scans.
+  // Any other error (a failed download attempt) is recomputed from OPFS, so a
+  // completed install recovers without waiting on a manual retry or a restart.
+  if (runtimeInitFailed && modelStatus.state === 'error') return Promise.resolve(modelStatus);
   return refreshModelStatus();
 }
 
@@ -255,27 +279,42 @@ function ensureEngine() {
 }
 
 /**
- * Load WASM/WebGPU and compile kernels before the first visible image asks.
- * Skipped in unit tests (no chrome.runtime.id) so fake ONNX bytes do not hang
- * the Node runner on a WASM fetch.
+ * Load WASM/WebGPU immediately, then give a real image a brief chance to own
+ * the compiling first session.run. If no image arrives, an idle zero pass
+ * warms the kernels as before. Skipped in unit tests (no chrome.runtime.id) so
+ * fake ONNX bytes do not hang the Node runner on a WASM fetch.
  */
 function scheduleEngineWarmup() {
   if (!chrome.runtime?.id) return;
-  void ensureEngine().catch((err) => {
-    // A verified weight file is necessary but not sufficient for a working
-    // detector. Surface missing/incompatible ORT assets in the popup instead
-    // of continuing to advertise READY while every scan fails.
-    modelStatus = {
-      state: 'error',
-      detail: `runtime initialization failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  });
+  void ensureEngine()
+    .then((engine) => {
+      setTimeout(() => {
+        void engine.warmup().catch(markRuntimeInitializationError);
+      }, 150);
+    })
+    .catch(markRuntimeInitializationError);
 }
 
-/** @param {ImageBitmap} bitmap */
-async function inferOrt(bitmap) {
+/** @param {unknown} err */
+function markRuntimeInitializationError(err) {
+  // A verified weight file is necessary but not sufficient for a working
+  // detector. Surface missing/incompatible ORT assets in the popup instead
+  // of continuing to advertise READY while every scan fails.
+  runtimeInitFailed = true;
+  modelStatus = {
+    state: 'error',
+    detail: `runtime initialization failed: ${err instanceof Error ? err.message : String(err)}`,
+  };
+}
+
+/**
+ * @param {ImageBitmap} bitmap
+ * @param {{graphicGated?: boolean}} [options]
+ * @returns {Promise<{raw: number, nativeMax?: number, nativeMedian?: number}>}
+ */
+async function inferOrt(bitmap, options) {
   const engine = await ensureEngine();
-  return engine.infer(bitmap);
+  return engine.infer(bitmap, options);
 }
 
 /**
@@ -295,6 +334,8 @@ function inferMock(sha256) {
 const inferQueue = createInferQueue({
   fetchConcurrency: FETCH_CONCURRENCY,
   inferConcurrency: INFER_CONCURRENCY,
+  /** @param {import('../shared/messages.js').InferRequest} req */
+  keyOf: (req) => req.id,
   /** @param {import('../shared/messages.js').InferRequest} req */
   priorityOf: (req) => (typeof req.priority === 'number' && Number.isFinite(req.priority) ? req.priority : 0),
   acquire: (req) => fetchImageBytes(req.url),
@@ -362,10 +403,49 @@ async function runInferInner(req, fetched, signal) {
   const started = performance.now();
   try {
     if (signal.aborted) throw signal.reason ?? new Error('scan job aborted');
+    // Some endpoints (Facebook's lookaside crawler proxy is one) answer a
+    // cookieless fetch with 200 + text/html. Decoding that as an image wastes
+    // the serialized infer slot and fails with an opaque InvalidStateError;
+    // reject on the declared type instead. An empty or octet-stream type still
+    // gets a decode attempt — createImageBitmap sniffs the actual bytes.
+    const declaredType = fetched.type.split(';')[0]?.trim().toLowerCase() ?? '';
+    if (
+      declaredType &&
+      !declaredType.startsWith('image/') &&
+      declaredType !== 'application/octet-stream'
+    ) {
+      throw new Error(`response is not an image: ${fetched.type}`);
+    }
     const blob = new Blob([fetched.bytes], { type: fetched.type });
     const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
     try {
+      // Decoded-size guard. MAX_IMAGE_BYTES bounds the wire size only; a
+      // decompression bomb decodes small→huge, and the graphic-stats pass +
+      // preprocessing canvases allocate O(pixels) per image.
+      if (bitmap.width * bitmap.height > MAX_DECODE_PIXELS) {
+        return {
+          id: req.id,
+          ok: false,
+          error: `image too large decoded: ${bitmap.width}x${bitmap.height} exceeds ${MAX_DECODE_PIXELS} pixels`,
+        };
+      }
       const hashPromise = sha256Hex(fetched.bytes);
+      // Content-type triage on the exact pixels the model will score. Cheap
+      // (~83k native pixels), and it must come from this decode: a resized
+      // copy would blur the flat/edge statistics it measures.
+      const graphic = bitmapGraphicStats(bitmap);
+      if (req.statsOnly) {
+        // Evaluation tooling path: statistics without inference. Never used
+        // by the scan pipeline, so it deliberately bypasses model status.
+        return {
+          id: req.id,
+          ok: true,
+          engine: 'stats',
+          graphic,
+          sha256: await hashPromise,
+          ms: performance.now() - started,
+        };
+      }
       // Default status is 'missing' until the startup refresh lands. A scan
       // that arrives in that window used to return no-model even when the
       // OPFS install was already valid — and the content-script latch then
@@ -373,12 +453,18 @@ async function runInferInner(req, fetched, signal) {
       const status =
         modelStatus.state === 'ready' ? modelStatus : await currentModelStatus();
       if (status.state === 'ready') {
-        const [raw, hash] = await Promise.all([inferOrt(bitmap), hashPromise]);
+        const [inferred, hash] = await Promise.all([
+          inferOrt(bitmap, { graphicGated: graphic.gated }),
+          hashPromise,
+        ]);
         return {
           id: req.id,
           ok: true,
-          raw,
+          raw: inferred.raw,
+          ...(inferred.nativeMax != null ? { nativeMax: inferred.nativeMax } : {}),
+          ...(inferred.nativeMedian != null ? { nativeMedian: inferred.nativeMedian } : {}),
           engine: 'ort',
+          graphic,
           sha256: hash,
           modelSha256: status.modelSha256,
           ms: performance.now() - started,
@@ -391,6 +477,7 @@ async function runInferInner(req, fetched, signal) {
           ok: true,
           raw: inferMock(hash),
           engine: 'mock',
+          graphic,
           sha256: hash,
           ms: performance.now() - started,
         };
@@ -414,6 +501,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case MSG.INFER_RUN:
       void enqueueInfer(msg).then(sendResponse);
       return true;
+    case MSG.INFER_PRIORITY:
+      sendResponse(inferQueue.reprioritize(msg.id, msg.priority));
+      return false;
+    case MSG.INFER_CANCEL:
+      inferQueue.clear('disabled');
+      sendResponse(true);
+      return false;
     case MSG.MODEL_STATUS_GET:
       void currentModelStatus()
         .catch((err) => /** @type {ModelStatus} */ ({ state: 'error', detail: String(err) }))

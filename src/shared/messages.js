@@ -14,11 +14,14 @@
 export const MSG = Object.freeze({
   // content -> SW (long-lived port, name PORT_SCAN)
   SCAN_REQUEST: 'scan:request',
+  SCAN_PRIORITY: 'scan:priority',
   // SW -> content (same port)
   SCAN_UPDATE: 'scan:update',
 
   // SW -> offscreen
   INFER_RUN: 'infer:run',
+  INFER_PRIORITY: 'infer:priority',
+  INFER_CANCEL: 'infer:cancel',
   MODEL_STATUS_GET: 'model:status-get',
   MODEL_DOWNLOAD: 'model:download',
 
@@ -26,6 +29,12 @@ export const MSG = Object.freeze({
   MODEL_PROGRESS: 'model:progress',
   // SW -> content scripts (all frames): weights just became usable
   MODEL_READY: 'model:ready',
+
+  // popup -> SW -> content: cosmetic blur of AI-scored images
+  BLUR_SETTING: 'blur:setting',
+  // popup -> SW -> content: master scan enable (mirrors blur:setting so the
+  // active tab does not wait on chrome.storage.onChanged)
+  ENABLED_SETTING: 'enabled:setting',
 
   // popup -> SW
   STATUS_GET: 'status:get',
@@ -58,22 +67,55 @@ export const TARGET = Object.freeze({
  * @property {number} height    - naturalHeight
  * @property {number} [priority] - SCAN_PRIORITY_VISIBLE outranks prefetch
  *
+ * @typedef {Object} ScanPriorityUpdate
+ * @property {string} id        - id of the request that owns the URL scan
+ * @property {number} priority  - newer visible work receives a larger value
+ *
  * @typedef {Object} ScanUpdate
  * @property {string} id
  * @property {string} [url] - echoed from the request so waiters can settle
  *                            even if the requesting element has been removed
  * @property {ScanState} state
  * @property {number} [probability]  - final fused P(AI), post-calibration
+ * @property {number} [display]      - integer the badge prints. A display-only
+ *                                     monotone remap of `probability`
+ *                                     (src/shared/display-score.js), sent from
+ *                                     here because the calibration curve it is
+ *                                     derived from lives in the SW. Never used
+ *                                     for the verdict.
  * @property {boolean} [isAI]        - probability >= 0.65 (fixed threshold)
  * @property {'ort' | 'mock'} [engine]
- * @property {Array<{name: string, bits: number}>} [contributions]
+ * @property {'graphic' | 'native-tiles'} [gate] - probability was capped
+ *                                     below the threshold. `graphic`: pixels
+ *                                     are flat graphics/text, not photographic
+ *                                     content (src/shared/graphic-gate.js).
+ *                                     `native-tiles`: the official downscale
+ *                                     crop looked generated but native 384
+ *                                     tiles did not agree (src/shared/native-veto.js).
+ * @property {Array<{name: string, bits: number | null, reason?: string}>} [contributions]
+ *                                     - log-odds contributions for the popover.
+ *                                     The override path reports bits: Infinity,
+ *                                     which JSON messaging delivers as null.
  * @property {string} [error]
  *
  * @typedef {Object} InferResult
  * @property {string} id
  * @property {boolean} ok
  * @property {number} [raw]          - raw detector score, pre-calibration
- * @property {'ort' | 'mock'} [engine]
+ *                                     (official-center crop; the native-tile
+ *                                     veto never overwrites this)
+ * @property {number} [nativeMax]    - strongest native 384 crop, present only
+ *                                     when the official transform downscaled
+ *                                     an AI-looking crop (src/shared/native-veto.js)
+ * @property {number} [nativeMedian] - median of those native crops; omitted
+ *                                     on early-abort when one tile already
+ *                                     agreed with the official AI score
+ * @property {'ort' | 'mock' | 'stats'} [engine] - 'stats' only for statsOnly
+ *                                     tooling requests; never a verdict
+ * @property {import('./graphic-gate.js').GraphicVerdict} [graphic]
+ *                                   - pixel-statistics verdict for the
+ *                                     graphic-content gate, measured on the
+ *                                     same decoded bitmap that was scored
  * @property {string} [sha256]       - content hash, memo key
  * @property {string} [modelSha256]  - exact verified model artifact used
  * @property {number} [ms]
@@ -85,6 +127,8 @@ export const TARGET = Object.freeze({
  * @property {boolean} allowMock - resolved by the service worker because
  *                                 offscreen documents only expose chrome.runtime
  * @property {number} [priority] - forwarded from the content-script scan request
+ * @property {boolean} [statsOnly] - evaluation tooling only: decode and return
+ *                                 graphic statistics without touching the model
  *
  * @typedef {'missing' | 'not-configured' | 'downloading' | 'ready' | 'error'} ModelState
  *

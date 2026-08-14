@@ -4,14 +4,23 @@ import assert from 'node:assert/strict';
 import {
   classifyImageCandidate,
   classifyPaintedCandidate,
+  compareViewportCandidates,
   cssBackgroundUrls,
   fittedImageRect,
   badgeAnchorPoint,
   isHostTopmostAtPoint,
   isBackgroundWatchTag,
+  isPageLayerOccluder,
+  isPreviewPaneBox,
+  attributeResetsObservation,
+  insetClipForOccluder,
   isRectInViewport,
+  isSameVisualInteractionOverlay,
   isSvgImageUrl,
+  overflowCanScroll,
+  overflowParentIsScroller,
   resetImageObservation,
+  shouldHideBadgeForOccluder,
   shouldRenderBadge,
   shouldSuppressDuplicateBadge,
   shouldSuppressPendingBadge,
@@ -46,6 +55,17 @@ test('on-screen boxes outrank rootMargin prefetch for infer-queue priority', () 
     true,
     'a box that still intersects the bottom edge is visible',
   );
+});
+
+test('visible candidates are ordered by useful painted area, then viewport focus', () => {
+  const viewport = { width: 1000, height: 800 };
+  const hero = { top: 100, left: 100, bottom: 700, right: 900 };
+  const thumbnail = { top: 10, left: 10, bottom: 110, right: 110 };
+  assert.ok(compareViewportCandidates(hero, thumbnail, viewport) < 0);
+
+  const centred = { top: 300, left: 400, bottom: 500, right: 600 };
+  const corner = { top: 0, left: 0, bottom: 200, right: 200 };
+  assert.ok(compareViewportCandidates(centred, corner, viewport) < 0);
 });
 
 test('displayed size can make a tiny thumbnail source eligible', () => {
@@ -178,6 +198,72 @@ test('fittedImageRect handles a DOMRect-like box (fields on the prototype, not o
   );
 });
 
+test('image class churn does not reset intersection observation', () => {
+  assert.equal(attributeResetsObservation(true, 'src'), true);
+  assert.equal(attributeResetsObservation(true, 'srcset'), true);
+  assert.equal(attributeResetsObservation(true, 'class'), false);
+  assert.equal(attributeResetsObservation(true, 'style'), false);
+  assert.equal(attributeResetsObservation(true, 'href'), false);
+  assert.equal(attributeResetsObservation(false, 'class'), true);
+  assert.equal(attributeResetsObservation(false, 'style'), true);
+  assert.equal(attributeResetsObservation(false, 'href'), false);
+  assert.equal(attributeResetsObservation(false, 'src'), false);
+});
+
+test('sticky/fixed overflow:auto panes host overlays before they overflow', () => {
+  const auto = {
+    overflowX: 'visible',
+    overflowY: 'auto',
+    scrollWidth: 400,
+    clientWidth: 400,
+    scrollHeight: 400,
+    clientHeight: 400,
+    position: 'static',
+  };
+  assert.equal(overflowCanScroll('visible', 'auto'), true);
+  assert.equal(overflowCanScroll('visible', 'visible'), false);
+  assert.equal(overflowParentIsScroller(auto), false);
+  assert.equal(overflowParentIsScroller({ ...auto, position: 'fixed' }), true);
+  assert.equal(overflowParentIsScroller({ ...auto, position: 'sticky' }), true);
+  assert.equal(overflowParentIsScroller({ ...auto, treatAsScroller: true }), true);
+  assert.equal(
+    overflowParentIsScroller({ ...auto, scrollHeight: 900 }),
+    true,
+    'an overflowing static scroller still hosts',
+  );
+  assert.equal(
+    overflowParentIsScroller({ ...auto, overflowY: 'visible', overflowX: 'overlay', scrollWidth: 900 }),
+    true,
+  );
+});
+
+test('sticky headers and side preview panes inset the overlay clip', () => {
+  const viewport = { left: 0, top: 0, right: 1200, bottom: 800 };
+  assert.deepEqual(
+    insetClipForOccluder(viewport, { left: 0, top: 0, right: 1200, bottom: 72 }),
+    { left: 0, top: 72, right: 1200, bottom: 800 },
+  );
+  assert.deepEqual(
+    insetClipForOccluder(viewport, { left: 720, top: 0, right: 1200, bottom: 800 }),
+    { left: 0, top: 0, right: 720, bottom: 800 },
+  );
+  assert.deepEqual(
+    insetClipForOccluder(viewport, { left: 0, top: 0, right: 1200, bottom: 800 }),
+    viewport,
+    'a full-viewport click catcher is not chrome',
+  );
+  assert.deepEqual(
+    insetClipForOccluder(viewport, { left: 1160, top: 8, right: 1192, bottom: 40 }),
+    viewport,
+    'a corner widget does not raise the clip',
+  );
+  const belowHeader = insetClipForOccluder(viewport, { left: 0, top: 0, right: 1200, bottom: 72 });
+  assert.deepEqual(
+    insetClipForOccluder(belowHeader, { left: 720, top: 0, right: 1200, bottom: 800 }),
+    { left: 0, top: 72, right: 720, bottom: 800 },
+  );
+});
+
 test('a source mutation resets observation even when no scan state exists yet', () => {
   /** @type {Array<['unobserve' | 'observe', Element]>} */
   const calls = [];
@@ -202,9 +288,9 @@ test('a source mutation resets observation even when no scan state exists yet', 
   ]);
 });
 
-test('image overlays are created only for completed finite scores', () => {
-  assert.equal(shouldRenderBadge('pending', undefined), false);
-  assert.equal(shouldRenderBadge('pending', 0.8), false);
+test('image overlays show progress immediately and accept only finite completed scores', () => {
+  assert.equal(shouldRenderBadge('pending', undefined), true);
+  assert.equal(shouldRenderBadge('pending', 0.8), true);
   assert.equal(shouldRenderBadge('unscannable', undefined), false);
   assert.equal(shouldRenderBadge('no-model', undefined), false);
   assert.equal(shouldRenderBadge('no-model', undefined, true), true);
@@ -248,6 +334,69 @@ test('a sticky page header hides the badge once it covers the image anchor', () 
     isHostTopmostAtPoint(host, [badge, overlayHost, imageChild], overlayHost, [badge]),
     true,
     'a visible badge on the anchor must not hide itself on the next reposition',
+  );
+
+  assert.equal(
+    isHostTopmostAtPoint(host, [overlayHost, stickyHeader, host], overlayHost, [], (element) =>
+      element === stickyHeader,
+    ),
+    true,
+    'the caller can admit a verified same-visual interaction layer',
+  );
+});
+
+test('chrome or page layers hide a badge that is not on the image', () => {
+  assert.equal(shouldHideBadgeForOccluder(true, 'fixed'), false);
+  assert.equal(shouldHideBadgeForOccluder(true, 'sticky'), false);
+  assert.equal(shouldHideBadgeForOccluder(true, 'absolute', true), false);
+  assert.equal(shouldHideBadgeForOccluder(false, 'fixed'), true);
+  assert.equal(shouldHideBadgeForOccluder(false, 'sticky'), true);
+  assert.equal(
+    shouldHideBadgeForOccluder(false, 'absolute'),
+    false,
+    'a covering media link must not swallow a finished score',
+  );
+  assert.equal(
+    shouldHideBadgeForOccluder(false, 'absolute', true),
+    true,
+    'an autocomplete menu or dialog covering the image hides its badge too',
+  );
+  assert.equal(
+    shouldHideBadgeForOccluder(false, 'absolute', false),
+    false,
+    'tile overlays inside the image box keep the badge',
+  );
+  assert.equal(shouldHideBadgeForOccluder(false, 'relative'), false);
+  assert.equal(shouldHideBadgeForOccluder(false, 'static'), false);
+  assert.equal(shouldHideBadgeForOccluder(false, ''), false);
+});
+
+test('isPageLayerOccluder only flags UI that spills past the image box', () => {
+  const hostBox = { left: 100, top: 100, right: 300, bottom: 250 };
+  assert.equal(
+    isPageLayerOccluder(hostBox, { left: 40, top: 30, right: 560, bottom: 400 }),
+    true,
+    'an autocomplete menu blanketing the tile is page-layer UI',
+  );
+  assert.equal(
+    isPageLayerOccluder(hostBox, { left: 100, top: 100, right: 300, bottom: 250 }),
+    false,
+    'a covering link matching the image box is the tile itself',
+  );
+  assert.equal(
+    isPageLayerOccluder(hostBox, { left: 100, top: 210, right: 300, bottom: 250 }),
+    false,
+    'a caption strip inside the image box is the tile itself',
+  );
+  assert.equal(
+    isPageLayerOccluder(hostBox, { left: 97, top: 100, right: 303, bottom: 250 }),
+    false,
+    'border-width overshoot within the margin is still the tile',
+  );
+  assert.equal(
+    isPageLayerOccluder(hostBox, { left: 100, top: 100, right: 300, bottom: 260 }),
+    true,
+    'anything clearly spilling past the image is page-layer UI',
   );
 });
 
@@ -303,6 +452,12 @@ test('rectangle overlap is measured against the smaller painted area', () => {
   const adjacent = { left: 100, top: 0, right: 200, bottom: 100 };
   assert.equal(smallerRectOverlap(full, inset), 1);
   assert.equal(smallerRectOverlap(full, adjacent), 0);
+});
+
+test('the right-hand viewer is a large box past mid-page, not a related-strip thumb', () => {
+  assert.equal(isPreviewPaneBox({ left: 900, width: 420, height: 280 }, 1200), true);
+  assert.equal(isPreviewPaneBox({ left: 80, width: 420, height: 280 }, 1200), false);
+  assert.equal(isPreviewPaneBox({ left: 900, width: 80, height: 80 }, 1200), false);
 });
 
 test('a settled verdict suppresses only a colliding pending badge on the same visual', () => {
@@ -397,6 +552,77 @@ test('badge anchor sticks to the visible edge', () => {
   assert.deepEqual(
     badgeAnchorPoint({ rect: { left: -300, top: 200, right: 400, bottom: 600 }, clip: viewport, inset: 4 }),
     { x: 4, y: 204, visible: true },
+  );
+});
+
+test('same-visual interaction overlays do not hide social-feed image badges', () => {
+  const image = { left: 180.5, top: 200, right: 696.5, bottom: 543.734375 };
+  const mediaLink = { left: 180.5, top: 200, right: 696.5, bottom: 543.328125 };
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: mediaLink,
+      hostAncestorDistance: 3,
+      overlayAncestorDistance: 1,
+      position: 'absolute',
+    }),
+    true,
+    'an X-style sibling link matching the image is part of the same visual',
+  );
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: mediaLink,
+      hostAncestorDistance: 3,
+      overlayAncestorDistance: 1,
+      position: 'fixed',
+    }),
+    false,
+    'viewport-fixed UI remains an occluder',
+  );
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: mediaLink,
+      hostAncestorDistance: 3,
+      overlayAncestorDistance: 1,
+      position: 'sticky',
+    }),
+    false,
+    'sticky page UI remains an occluder',
+  );
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: { left: 180.5, top: 200, right: 696.5, bottom: 250 },
+      hostAncestorDistance: 3,
+      overlayAncestorDistance: 1,
+      position: 'absolute',
+    }),
+    false,
+    'a narrow toolbar inside the image is not treated as a full-media link',
+  );
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: mediaLink,
+      hostAncestorDistance: 8,
+      overlayAncestorDistance: 2,
+      position: 'absolute',
+    }),
+    false,
+    'a matching rectangle elsewhere in the page tree is unrelated',
+  );
+  assert.equal(
+    isSameVisualInteractionOverlay({
+      hostRect: image,
+      overlayRect: { left: 180.5, top: 200, right: 180.5, bottom: 543.328125 },
+      hostAncestorDistance: 3,
+      overlayAncestorDistance: 1,
+      position: 'absolute',
+    }),
+    false,
+    'a zero-area element cannot represent the painted visual',
   );
 });
 

@@ -12,6 +12,13 @@
  */
 
 export const MODEL_INPUT_SIZE = 384;
+/**
+ * Also the scanner's source-upgrade gate: below this short edge the resize
+ * becomes an upscale, so the scanner goes looking for a larger source
+ * (src/content/source-upgrade.js). Declared here rather than in
+ * shared/constants.js because that module reads the build-time __DEV_BUILD__
+ * global and so cannot be imported by the offscreen unit tests.
+ */
 export const OFFICIAL_RESIZE_SHORT_EDGE = 440;
 /** @type {readonly [number, number, number]} */
 export const IMAGENET_MEAN = Object.freeze([0.485, 0.456, 0.406]);

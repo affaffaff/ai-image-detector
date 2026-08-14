@@ -3,9 +3,15 @@
 
 import { readFileSync } from 'node:fs';
 
+import { MonotoneCalibrator } from '../src/fusion/calibration.js';
+import { displayPercent, reportableRange } from '../src/shared/display-score.js';
+
 const fusedCalibration = JSON.parse(
   readFileSync(new URL('../models/calibration/fused.json', import.meta.url), 'utf8'),
 );
+// Badge text is a display-only remap of the probability; assert against the
+// same module the extension uses rather than a second copy of the mapping.
+const displayRange = reportableRange(MonotoneCalibrator.fromJSON(fusedCalibration));
 const smokeImagePath = process.env.AID_SMOKE_IMAGE;
 const smokeImageDataUrl = smokeImagePath
   ? `data:${smokeImagePath.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg'};base64,${readFileSync(smokeImagePath).toString('base64')}`
@@ -139,6 +145,8 @@ const injected = await cdp.send(
       context.fillStyle = '#f7f3e9';
       context.font = 'bold 48px sans-serif';
       context.fillText('REAL ORT', 65, 205);
+      const media = document.createElement('div');
+      media.style.cssText = 'position:relative;width:384px;height:384px';
       const image = document.createElement('img');
       image.id = 'detector-smoke-image';
       image.width = 384;
@@ -152,7 +160,13 @@ const injected = await cdp.send(
       });
       image.onerror = () => reject(new Error('smoke image failed to load'));
       image.src = ${smokeImageDataUrl ? JSON.stringify(smokeImageDataUrl) : "canvas.toDataURL('image/png')"};
-      document.querySelector('main').appendChild(image);
+      const mediaLink = document.createElement('a');
+      mediaLink.href = '#media';
+      mediaLink.setAttribute('aria-label', 'Open media');
+      mediaLink.style.cssText =
+        'position:absolute;inset:0;z-index:10;background:transparent;display:block';
+      media.append(image, mediaLink);
+      document.querySelector('main').appendChild(media);
     })`,
     awaitPromise: true,
     returnByValue: true,
@@ -372,19 +386,21 @@ const result = expectedMode === 'no-model' ? {
   // of waiting for a memo entry that must never exist.
   const probability = applyCalibration(directRaw);
   const isAI = probability >= 0.65;
-  const expectedPercent = Math.round(probability * 100);
+  const expectedPercent = displayPercent(probability, isAI, displayRange);
   const expectedInlineBadge = expectedMode === 'mock'
     ? 'MOCK'
     : `${isAI ? 'AI ' : ''}${expectedPercent}%`;
   const displayed = /^(AI )?(\d+)%$/.exec(expectedBadge);
   // Separate WebGPU runs of the same image may straddle a display-rounding
-  // boundary. Keep the verdict prefix exact and allow only one percentage
-  // point; larger drift still fails as a calibration/runtime regression.
+  // boundary. Keep the verdict prefix exact and allow two points: the badge
+  // axis spans the reportable range rather than 0..1, so it resolves ~2.3x
+  // finer than the probability it replaced and the same float nondeterminism
+  // now covers more of it. Larger drift still fails as a regression.
   const withinWebGpuDisplayTolerance =
     expectedMode === 'ort' &&
     displayed !== null &&
     (displayed[1] ?? '') === (isAI ? 'AI ' : '') &&
-    Math.abs(Number(displayed[2]) - expectedPercent) <= 1;
+    Math.abs(Number(displayed[2]) - expectedPercent) <= 2;
   if (expectedBadge !== expectedInlineBadge && !withinWebGpuDisplayTolerance) {
     throw new Error(
       `inline badge calibration mismatch: got ${expectedBadge}, expected ${expectedInlineBadge}`,

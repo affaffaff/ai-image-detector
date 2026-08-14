@@ -396,7 +396,11 @@ def main() -> int:
         if stop:
             break
 
-    all_records = list(existing.values()) + records
+    # Every record appended above is also mirrored into `existing` (keyed by
+    # path) so repeat topics dedupe within the run. Adding `records` again
+    # here wrote each new image into the index twice, inflating `count` and
+    # double-weighting those files for any consumer reading the records list.
+    all_records = list(existing.values())
     args.index.parent.mkdir(parents=True, exist_ok=True)
     args.index.write_text(json.dumps({
         "source": "wikimedia-commons",

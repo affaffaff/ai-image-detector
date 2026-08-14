@@ -13,6 +13,9 @@ function valueAfter(flag) {
 
 const manifestPath = resolve(valueAfter('--set'));
 const outputPath = resolve(valueAfter('--out'));
+// --stats-only: decode + graphic-content statistics through the extension's
+// exact runtime path, no model inference. Works on builds without weights.
+const statsOnly = args.includes('--stats-only');
 const port = Number(process.env.AID_CDP_PORT ?? 9333);
 const endpoint = `http://127.0.0.1:${port}`;
 
@@ -47,6 +50,14 @@ function parseCsv(text) {
   if (quoted) throw new Error('unterminated quoted CSV field');
   const [header, ...body] = records;
   if (!header) throw new Error('empty CSV');
+  // A repeated column name silently collapses in Object.fromEntries (last
+  // wins), so a manifest with two `path` columns would score the wrong files
+  // without any error. Reject it instead.
+  const seen = new Set();
+  for (const name of header) {
+    if (seen.has(name)) throw new Error(`duplicate CSV column '${name}'`);
+    seen.add(name);
+  }
   return {
     header,
     rows: body.map((values, rowIndex) => {
@@ -186,18 +197,20 @@ if (!serviceWorker) throw new Error('AI detector service worker target not found
 const cdp = new Cdp(serviceWorker.webSocketDebuggerUrl);
 await cdp.open();
 await cdp.send('Runtime.enable');
-await retry(async () => {
-  const evaluated = await cdp.send('Runtime.evaluate', {
-    expression: `chrome.runtime.sendMessage({type: 'model:status-get', target: 'offscreen'})`,
-    awaitPromise: true,
-    returnByValue: true,
-  });
-  if (evaluated.exceptionDetails) throw new Error('model status request failed');
-  if (evaluated.result?.value?.state !== 'ready') {
-    throw new Error(`model is still ${evaluated.result?.value?.state ?? 'unavailable'}`);
-  }
-  return evaluated;
-}, 60_000);
+if (!statsOnly) {
+  await retry(async () => {
+    const evaluated = await cdp.send('Runtime.evaluate', {
+      expression: `chrome.runtime.sendMessage({type: 'model:status-get', target: 'offscreen'})`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (evaluated.exceptionDetails) throw new Error('model status request failed');
+    if (evaluated.result?.value?.state !== 'ready') {
+      throw new Error(`model is still ${evaluated.result?.value?.state ?? 'unavailable'}`);
+    }
+    return evaluated;
+  }, 60_000);
+}
 
 const outputRows = [];
 try {
@@ -213,39 +226,79 @@ try {
         id: ${JSON.stringify(`browser-score-${index}`)},
         url: ${JSON.stringify(dataUrl)},
         allowMock: false,
+        statsOnly: ${statsOnly},
       })`,
       awaitPromise: true,
       returnByValue: true,
     });
     if (evaluated.exceptionDetails) throw new Error(`browser evaluation failed for ${row.image_id}`);
     const result = evaluated.result?.value;
-    if (!result?.ok || result.engine !== 'ort' || !Number.isFinite(result.raw)) {
-      throw new Error(`ORT failed for ${row.image_id}: ${JSON.stringify(result)}`);
+    const expectedEngine = statsOnly ? 'stats' : 'ort';
+    if (!result?.ok || result.engine !== expectedEngine || (!statsOnly && !Number.isFinite(result.raw))) {
+      throw new Error(`${expectedEngine} failed for ${row.image_id}: ${JSON.stringify(result)}`);
     }
     if (result.sha256 !== row.image_sha256) {
       throw new Error(`input image hash mismatch for ${row.image_id}`);
     }
-    if (!/^[0-9a-f]{64}$/.test(result.modelSha256 ?? '')) {
+    if (!statsOnly && !/^[0-9a-f]{64}$/.test(result.modelSha256 ?? '')) {
       throw new Error(`runtime did not identify the model artifact for ${row.image_id}`);
     }
-    outputRows.push({
-      ...row,
-      score_official_browser: result.raw.toFixed(10),
-      score: result.raw.toFixed(10),
-      model_sha256: result.modelSha256,
-      browser: version.Browser,
-      image_sha256: result.sha256,
-      inference_ms: Number(result.ms).toFixed(1),
-    });
+    const graphic = result.graphic;
+    if (!graphic || typeof graphic.gated !== 'boolean') {
+      throw new Error(`runtime did not report graphic statistics for ${row.image_id}`);
+    }
+    const graphicColumns = {
+      graphic_gated: graphic.gated ? 1 : 0,
+      graphic_flat: Number(graphic.flatFraction).toFixed(6),
+      graphic_soft: Number(graphic.softFraction).toFixed(6),
+      graphic_hard: Number(graphic.hardFraction).toFixed(6),
+      graphic_top8: Number(graphic.top8Mass).toFixed(6),
+      graphic_maxpatchsoft: Number(graphic.maxPatchSoft).toFixed(6),
+      graphic_colors: graphic.distinctColors,
+      graphic_pixels: graphic.pixels,
+    };
+    outputRows.push(
+      statsOnly
+        ? {
+            ...row,
+            ...graphicColumns,
+            browser: version.Browser,
+            image_sha256: result.sha256,
+            inference_ms: Number(result.ms).toFixed(1),
+          }
+        : {
+            ...row,
+            score_official_browser: result.raw.toFixed(10),
+            score: result.raw.toFixed(10),
+            ...graphicColumns,
+            model_sha256: result.modelSha256,
+            browser: version.Browser,
+            image_sha256: result.sha256,
+            inference_ms: Number(result.ms).toFixed(1),
+          },
+    );
     if ((index + 1) % 10 === 0 || index + 1 === parsed.rows.length) {
-      console.error(`[${index + 1}/${parsed.rows.length}] ${row.image_id} = ${result.raw.toFixed(6)}`);
+      const detail = statsOnly ? `gated=${graphic.gated ? 1 : 0}` : `= ${result.raw.toFixed(6)}`;
+      console.error(`[${index + 1}/${parsed.rows.length}] ${row.image_id} ${detail}`);
     }
   }
 } finally {
   cdp.socket.close();
 }
 
-const generated = ['score_official_browser', 'score', 'model_sha256', 'browser', 'image_sha256', 'inference_ms'];
+const graphicGenerated = [
+  'graphic_gated',
+  'graphic_flat',
+  'graphic_soft',
+  'graphic_hard',
+  'graphic_top8',
+  'graphic_maxpatchsoft',
+  'graphic_colors',
+  'graphic_pixels',
+];
+const generated = statsOnly
+  ? [...graphicGenerated, 'browser', 'image_sha256', 'inference_ms']
+  : ['score_official_browser', 'score', ...graphicGenerated, 'model_sha256', 'browser', 'image_sha256', 'inference_ms'];
 const header = [...parsed.header.filter((name) => !generated.includes(name)), ...generated];
 writeCsv(header, outputRows);
 console.log(JSON.stringify({ browser: version.Browser, images: outputRows.length, out: outputPath }));

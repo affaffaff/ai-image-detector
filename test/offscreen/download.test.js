@@ -167,6 +167,29 @@ test('an interrupted download resumes from its durable partial', async (t) => {
   assert.equal(directory.read('resume.part'), null);
 });
 
+test('a whitespace-padded Content-Range still resumes instead of failing', async (t) => {
+  const directory = installOpfs(t);
+  const artifact = Uint8Array.of(1, 2, 3, 4, 5, 6);
+  const model = await entry('padded-range', artifact);
+  directory.seed('padded-range.part', artifact.slice(0, 3));
+  replaceFetch(t, async (_url, options) => {
+    assert.equal(options.headers.Range, 'bytes=3-');
+    // Some CDNs/proxies pad the header; a strict match used to throw
+    // "invalid Content-Range" and kill the resumable download for good.
+    return bytesResponse(artifact.slice(3), {
+      status: 206,
+      headers: {
+        'Content-Length': '3',
+        'Content-Range': ' bytes 3-5/6  ',
+      },
+    });
+  });
+
+  const installed = await downloadAndInstall(model);
+  assert.equal(installed.size, artifact.byteLength);
+  assert.deepEqual(directory.read('padded-range'), artifact);
+});
+
 test('a server that ignores Range restarts cleanly without duplicating bytes', async (t) => {
   const directory = installOpfs(t);
   const artifact = Uint8Array.of(10, 20, 30, 40, 50, 60);

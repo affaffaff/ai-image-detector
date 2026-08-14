@@ -6,6 +6,7 @@ test('mock inference works when the offscreen context exposes runtime but not st
   const originalChrome = globalThis.chrome;
   const originalFetch = globalThis.fetch;
   const originalCreateImageBitmap = globalThis.createImageBitmap;
+  const originalOffscreenCanvas = globalThis.OffscreenCanvas;
   const originalDevBuild = globalThis.__DEV_BUILD__;
 
   let onMessage = null;
@@ -36,13 +37,38 @@ test('mock inference works when the offscreen context exposes runtime but not st
       headers: { 'Content-Type': 'image/png' },
     });
   };
-  globalThis.createImageBitmap = async () => ({ close() {} });
+  globalThis.createImageBitmap = async () => ({ width: 64, height: 48, close() {} });
+  // The graphic-content gate reads patches through OffscreenCanvas, which
+  // Node does not have. An all-white readback exercises the real statistics
+  // code and must come out "not gated" (flat but edge-free).
+  globalThis.OffscreenCanvas = class {
+    constructor(width, height) {
+      this.width = width;
+      this.height = height;
+    }
+    getContext() {
+      const canvas = this;
+      return {
+        fillStyle: '',
+        fillRect() {},
+        drawImage() {},
+        getImageData(_x, _y, width, height) {
+          return { data: new Uint8ClampedArray(width * height * 4).fill(255) };
+        },
+        get canvas() {
+          return canvas;
+        },
+      };
+    }
+  };
 
   t.after(() => {
     if (originalChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;
     globalThis.createImageBitmap = originalCreateImageBitmap;
+    if (originalOffscreenCanvas === undefined) delete globalThis.OffscreenCanvas;
+    else globalThis.OffscreenCanvas = originalOffscreenCanvas;
     if (originalDevBuild === undefined) delete globalThis.__DEV_BUILD__;
     else globalThis.__DEV_BUILD__ = originalDevBuild;
   });
@@ -76,4 +102,8 @@ test('mock inference works when the offscreen context exposes runtime but not st
   assert.equal(result.id, 'test-image');
   assert.equal(typeof result.raw, 'number');
   assert.match(result.sha256, /^[a-f0-9]{64}$/);
+  // Graphic statistics ride along with every decoded result; a plain white
+  // field has no hard edges and must not gate.
+  assert.equal(result.graphic?.gated, false);
+  assert.ok(result.graphic.flatFraction > 0.99);
 });
