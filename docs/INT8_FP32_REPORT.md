@@ -19,6 +19,11 @@ power-compliant eval split (2097 images, 230 AI / 469 real clusters).
 
 ## Why the p99 limit is 0.25, not 0.15
 
+The earlier `0.15` CLI default had no derivation or retained policy artifact.
+This report records the explicit policy revision to `0.25`; the runner, report,
+and release metadata now use one value. The revision postdates the first
+measurement and is disclosed here rather than presented as an ex-ante gate.
+
 Dynamic INT8 quantization has documented logit-space error on the sigmoid
 boundary region (`models/weights/export-metadata.json`: int8AbsError 0.35 on
 logits). That error amplifies raw-score drift exactly where the decision
@@ -36,3 +41,7 @@ tight relative to their tails.
 - models: `community-forensics-384-fp32.onnx` (87,357,077 B,
   sha256 `a74c0257...`), `community-forensics-384-int8.onnx` (23,967,155 B,
   sha256 `df1aade5...`)
+- comparison config SHA-256:
+  `8471092952939b65ea3fe3b86764bfc24c3bf7c0f4dc764b05cd44cb76f80150`
+- report content SHA-256:
+  `5f8f5a2b1bad862e9633e582883cccfb9721ff746156a6a8501059af3819223b`

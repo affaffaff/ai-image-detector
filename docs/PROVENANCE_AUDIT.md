@@ -1,6 +1,6 @@
 # Model redistribution and provenance audit
 
-Audit date: 2026-08-14. Status: **complete, pending owner sign-off.**
+Audit date: 2026-08-14. Status: **complete and owner-approved.**
 
 This is the three-way weights / base-model / training-data check required before
 `models[0].url` may point at a public artifact. It is engineering diligence
@@ -124,8 +124,10 @@ analyses at runtime.
 |---|---|
 | Prepared | 2026-08-14 |
 | Evidence sources | first-party model, dataset, backbone, and code repository pages |
-| Owner sign-off | _pending_ |
+| Owner sign-off | `affaffaff` - approved 2026-08-14 |
 
-Until the owner signs off here, `models/calibration/fused.json` keeps
-`shippingStatus: "quarantined"` and `models[0].url` stays null, per
+This sign-off closes the redistribution/provenance gate only. The calibration
+curve remains quarantined and `models[0].url` remains null because the frozen
+native-format nuisance battery fails independently; see
+[`NUISANCE_BATTERY_REPORT.md`](NUISANCE_BATTERY_REPORT.md) and
 [`COMPLIANCE.md`](COMPLIANCE.md).

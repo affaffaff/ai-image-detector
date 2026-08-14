@@ -28,9 +28,10 @@ score is uploaded to a detector service—there is no detector service.
 > [!IMPORTANT]
 > **Release status (2026-08-14):** the fixed-0.65 unseen-generator evaluation
 > passes at **0.8799 balanced accuracy**, but this is not yet a distributable
-> production release. The model URL is still null and the calibration curve is
-> quarantined pending model-redistribution sign-off, an INT8-versus-FP32 release
-> report, artifact hosting, and final hosted-model checks.
+> production release. The build, owner-approved redistribution audit, and
+> INT8-versus-FP32 report pass. The model URL is still null and the calibration
+> curve remains quarantined because the frozen native-format nuisance battery
+> fails; publication and hosted checks therefore cannot proceed.
 
 ---
 
@@ -209,18 +210,20 @@ INT8, and metadata files.
 
 Hosting weights makes us a distributor, not merely a user, so every publicly
 released weight file must pass a **three-way check** — the weights' own licence,
-the base model's, and the training data's terms. The authors mark the Community
-Forensics weights MIT and the timm backbone is Apache-2.0, but the final
-provenance/redistribution audit is not yet signed off. That is why the public
-model URL remains null.
+the base model's, and the training data's terms. The owner-approved
+[`docs/PROVENANCE_AUDIT.md`](docs/PROVENANCE_AUDIT.md) records a PASS: the
+Community Forensics weights are MIT, the timm backbone is Apache-2.0 and
+contributes no pretrained bytes, and this project does not use or redistribute
+the training dataset.
 
 One result is worth stating explicitly, because it is easy to get wrong: the
 Community Forensics **weights are marked MIT**, while the Community Forensics
-**datasets are CC-BY-NC-SA** (non-commercial, share-alike). We do **not**
-download, train on, evaluate against, or redistribute those datasets.
+dataset card states **CC BY 4.0**, with research-purpose and per-image-license
+qualifiers for dataset users. We do **not** download, train on, evaluate
+against, or redistribute that dataset.
 Calibration and evaluation use independent sources, including OpenSDID+ under
 CC BY-SA 4.0 and separately sourced real images. The normal build does not yet
-distribute the model weights.
+distribute the model weights because a separate nuisance-battery gate fails.
 
 ---
 
@@ -242,7 +245,11 @@ The result covers 2,097 web-degraded images from 230 AI and 469 real source
 clusters. It clears the 0.75 gate, meets the 100-cluster-per-class power floor,
 and records `underpowered: false`. The construction-only shortcut audit passes
 at grouped-CV AUC 0.5192, and the detector beats the strongest fitted nuisance
-null by +0.2545 BA (95% CI [0.2135, 0.2957]).
+null on the source-matched web-realistic pack by +0.2545 BA (95% CI [0.2135,
+0.2957]). That does not override the independent native-format result: the
+frozen B1-B5 permutation battery fails, and its codec null reaches 0.8889 BA
+against the detector's 0.8651. See
+[`docs/NUISANCE_BATTERY_REPORT.md`](docs/NUISANCE_BATTERY_REPORT.md).
 
 The local evidence workspace retains the scored rows and acceptance report at
 `data/matched/browser-scores-all.csv` and
@@ -250,7 +257,7 @@ The local evidence workspace retains the scored rows and acceptance report at
 deliberately gitignored. The report pins the exact calibration bytes used for
 the run, and that seal is current: the calibration hash recorded in
 `gated-eval-all.json` equals the SHA-256 of the shipped `fused.json`
-(`671efd4e…`), and the last entry of the hash-chained `gated-eval-all.jsonl`
+(`01f62f01…`), and the last entry of the hash-chained `gated-eval-all.jsonl`
 log matches the report file on disk. No re-seal is outstanding.
 
 With an evaluation environment activated and `tools/requirements.txt`

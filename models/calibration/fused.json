@@ -320,6 +320,33 @@
     0.98274345,
     0.98567221
   ],
+  "precisionComparison": {
+    "status": "pass",
+    "p99AbsoluteRawDrift": 0.2408901439776347,
+    "maxP99AbsoluteDrift": 0.25,
+    "decisionDisagreementRate": 0.01335240820219361,
+    "balancedAccuracyDrop": 0.0017907357621828046,
+    "configSha256": "8471092952939b65ea3fe3b86764bfc24c3bf7c0f4dc764b05cd44cb76f80150",
+    "reportContentSha256": "5f8f5a2b1bad862e9633e582883cccfb9721ff746156a6a8501059af3819223b"
+  },
+  "provenanceAudit": {
+    "status": "pass",
+    "owner": "affaffaff",
+    "approved": "2026-08-14",
+    "path": "docs/PROVENANCE_AUDIT.md"
+  },
+  "nuisanceBattery": {
+    "status": "fail",
+    "protocolVersion": "explain-it-away-v2-permutation",
+    "freezeSha256": "3074633815e3ec9cf49782d07fd3c61ea8b2b816504676789fecdf8e3387d8c5",
+    "configSha256": "b8e245222151aa94c526c3d8dfecd07efe8c8ceb37a88ce1117b10e8a14e6c5c",
+    "corpusHash": "bfcc083b9207751c781448b1cea06677325f3a8c23b713efeace8e650287117d",
+    "reportSha256": "789f729b16a9f69643187cabddedfc4ca5647dc318406f97ef51462565f0cd74",
+    "noPassBecause": [
+      "corpusGate=fail",
+      "detector-minus-best-null CI includes zero"
+    ]
+  },
   "shippingStatus": "quarantined",
-  "quarantineReason": "All measurable gates PASSED on the source-matched full-power corpus: construction-only audit AUC 0.519 (< 0.70); held-out BA 0.8799 (CI [0.855, 0.904] >= 0.75) on 230 AI / 469 real clusters (underpowered=False); null-battery margin +0.2545 (CI [0.214, 0.296] excludes 0). Publication still gated on the provenance/license shipping audit (three-way weights check) and hosting the model artifact before the URL ships."
+  "quarantineReason": "The web-realistic accuracy chain passes (construction audit AUC 0.519; held-out BA 0.8799, CI [0.855, 0.904]), the provenance audit is owner-approved, and the INT8/FP32 report passes its documented gates. The frozen native-format nuisance battery fails: B1/B2/B3/B5 have Bonferroni-corrected p=0.000500 with excess >=0.10, and detector-minus-codec-null BA is -0.0238 (CI [-0.0602, 0.0105]). Keep quarantined and url null until a new native corpus passes the unchanged protocol; immutable hosting and final hosted online/offline checks remain downstream."
 }

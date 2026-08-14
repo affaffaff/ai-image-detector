@@ -92,6 +92,15 @@ export function assertShippingContract({ root = ROOT, dist = null, localTest = f
     if (!curve.calibrationRowsSha256 || !curve.evalRowsSha256 || !curve.refitConfigSha256) {
       throw new Error('shipping curve lacks split/config hashes');
     }
+    if (curve.provenanceAudit?.status !== 'pass' || !curve.provenanceAudit?.owner) {
+      throw new Error('shipping curve lacks owner-approved provenance evidence');
+    }
+    if (curve.precisionComparison?.status !== 'pass') {
+      throw new Error('shipping curve lacks a passing INT8/FP32 comparison');
+    }
+    if (curve.nuisanceBattery?.status !== 'pass') {
+      throw new Error('shipping curve lacks a passing frozen native-format nuisance battery');
+    }
   }
 
   if (dist) {

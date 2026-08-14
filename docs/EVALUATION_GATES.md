@@ -85,18 +85,30 @@ spectral, blockiness, multivariate, and 32×32-pixel nulls; oracle contamination
 checks; and paired detector-minus-best-null cluster intervals.
 
 > [!IMPORTANT]
-> **Known gap — the corpus gate in the tool is not the one this project froze.**
-> `eval-protocol.md` replaces the fixed oracle-BA thresholds with a cluster-label
-> permutation test (`B_perm = 10000`, Bonferroni across probes, FAIL on corrected
-> `p < 0.01` **and** `excess >= 0.10`), and shows the fixed rule is wrong: at 25
-> clusters per class a purely random probe trips the old WARN threshold 71% of
-> the time. `explain_it_away.py:939` still applies the old rule
-> (`>= 0.70` fail, `>= 0.60` warn), and no permutation test exists anywhere in
-> `tools/`. Consequently the current battery artifact reports
-> `corpusGate: "warn"` at max oracle BA 0.6827 — a value the frozen protocol
-> would not by itself treat as evidence of contamination at this sample size.
-> Read that warn against the protocol, not at face value, until the gate is
-> implemented.
+> **The frozen permutation gate is implemented and the native pack fails it.**
+> `explain_it_away.py` permutes labels at source-cluster level with
+> `B_perm = 10000`, applies Bonferroni correction across predeclared probes
+> B1-B5, and requires both corrected `p < 0.01` and `excess >= 0.10` for FAIL.
+> The 2026-08-14 native-format run fails B1, B2, B3, and B5; B4 warns. A
+> FIT-trained codec null also outperforms the detector, with the paired
+> detector-minus-null interval including zero. Exact results and hashes are in
+> [`NUISANCE_BATTERY_REPORT.md`](NUISANCE_BATTERY_REPORT.md). This is a release
+> blocker, not a tooling gap.
+
+Reproduce the frozen native cell from the local evidence workspace:
+
+```powershell
+.venv-export\Scripts\python.exe tools\explain_it_away.py `
+  --pack data\matched\pack-all `
+  --source-root . `
+  --out data\matched\native-battery `
+  --phase freeze,stress `
+  --stress-cells native `
+  --bootstrap-samples 10000
+```
+
+The command caches hash-verified scores and extracted features, so interrupted
+runs resume without rescoring completed native inputs.
 
 Every report leads with exactly three operating-point values at `0.65`: TPR,
 TNR, and balanced accuracy, each with its clustered 95% CI. Run separate,
@@ -133,7 +145,8 @@ numbers, the gate limits, and every input hash needed to re-run it.
 model/runtime/curve contract. A public model URL is rejected unless the curve
 is `validated`, references passing leakage audits (construction feature set),
 carries split/config hashes, and clears 0.75 on a power-compliant eval (>= 100
-source clusters per class). The current URL is null and the curve is quarantined
-pending the provenance/license shipping audit and hosting, not because of the
-leakage or accuracy gates — those pass (construction audit AUC 0.519; held-out
-BA 0.8799 CI [0.855, 0.904]; null-battery margin +0.2545 excluding zero).
+source clusters per class). The current URL is null and the curve is
+quarantined. The source-matched construction audit and held-out accuracy gate
+pass, as do provenance and the documented INT8 comparison, but the independent
+native-format nuisance battery fails and therefore prevents validation,
+publication, and final hosted checks.

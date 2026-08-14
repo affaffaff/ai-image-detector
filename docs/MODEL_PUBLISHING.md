@@ -3,6 +3,12 @@
 The setup path is ready, but production publication requires an account-owned
 public host and explicit authorization to upload there.
 
+> [!IMPORTANT]
+> Publication is currently blocked before hosting: the frozen native-format
+> nuisance battery fails. `models[0].url` must remain null and the curve must
+> remain quarantined until a new native corpus passes the unchanged protocol in
+> `NUISANCE_BATTERY_REPORT.md`.
+
 The only acceptable artifact is:
 
 | Field | Value |
@@ -17,8 +23,9 @@ Use an immutable public release asset or model-repository revision. After the
 upload, set `models[0].url` in `models/manifest.json` to a direct-download URL;
 then run `npm run assert:shipping`. The assertion refuses a public URL while
 the calibration curve is quarantined, lacks passing leakage audits/split
-hashes, or fails the fixed-0.65 accuracy gate.
-do not change the pinned byte length or digest.
+hashes, fails the fixed-0.65 accuracy gate, lacks owner-approved provenance or
+passing INT8 evidence, or lacks a passing frozen native nuisance battery. Do
+not change the pinned byte length or digest.
 
 Publication is complete only after all of these checks pass:
 

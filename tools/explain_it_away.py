@@ -1110,7 +1110,11 @@ def run_null_shootout(
         "slices": slice_tables(eval_rows, SCORE_COLUMN),
         "noPassBecause": [item for item in [
             "underpowered" if detector["underpowered"] else None,
+            "detector BA lower CI <= 0.75"
+            if detector["balancedAccuracy"]["ci"][0] <= 0.75 else None,
             "corpusGate=" + corpus_gate if corpus_gate != "pass" else None,
+            "detector-minus-best-null CI includes zero"
+            if not delta["excludesZero"] else None,
             "not native-format" if any(row.get("degradation") != "native" for row in eval_rows) else None,
         ] if item],
     }
