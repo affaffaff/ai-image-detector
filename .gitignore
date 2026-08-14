@@ -5,14 +5,17 @@
 /notes/
 /docs/benchmark-replica.md
 
-# Dependencies and build output
+# Dependencies
 /node_modules/
-/dist/
 
-# Model weights are downloaded at setup and hash-verified against
+# Source model weights are downloaded at setup and hash-verified against
 # models/manifest.json (which IS committed). Weight binaries never enter git.
 /models/weights/
 *.onnx
+
+# dist/ IS committed so people can load the extension in Chrome directly.
+# Exception: bundled int8 model inside dist must not be ignored by *.onnx.
+!/dist/**/*.onnx
 
 # Eval datasets and score arrays stay private and are never committed
 /data/

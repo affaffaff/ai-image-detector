@@ -1,0 +1,50 @@
+{
+  "formatVersion": 1,
+  "comment": "Primary model contract is fixed to the official OwensLab Community Forensics 384px checkpoint. Preprocessing is settled on official-center (Resize440+CenterCrop384). The provenance audit is owner-approved and the INT8 comparison passes at its documented 0.25 p99 limit, but the frozen native-format nuisance battery fails. url therefore remains null and the fused curve remains quarantined; publication readiness is separate from the preprocessing choice.",
+  "models": [
+    {
+      "id": "detector-primary",
+      "url": null,
+      "sha256": "df1aade56566b892178154793bfa95cf5808339d77593ec8137e7c5e306f2035",
+      "bytes": 23967155,
+      "license": "MIT",
+      "source": "https://huggingface.co/OwensLab/commfor-model-384",
+      "baseModel": {
+        "id": "timm/vit_small_patch16_384.augreg_in21k_ft_in1k",
+        "license": "Apache-2.0"
+      },
+      "artifact": {
+        "format": "onnx",
+        "precision": "dynamic-int8",
+        "file": "community-forensics-384-int8.onnx"
+      },
+      "input": {
+        "name": "pixel_values",
+        "dtype": "float32",
+        "layout": "NCHW",
+        "width": 384,
+        "height": 384,
+        "normalization": "imagenet"
+      },
+      "output": {
+        "name": "fake_logit",
+        "semantic": "fake-logit",
+        "activation": "sigmoid"
+      },
+      "tiling": {
+        "mode": "official-center",
+        "nativeResolution": false,
+        "aggregation": "single-crop",
+        "resizeShortEdge": 440,
+        "cropSize": 384
+      },
+      "calibration": {
+        "path": "calibration/fused.json",
+        "id": "cf384-browser-official-center-pooled-webrealistic-v2",
+        "inputScoreColumn": "score_official_browser"
+      },
+      "notes": "Official 21.8M-parameter Community Forensics ViT-S. Shipped preprocessing is the authors' Resize(440 short edge) + CenterCrop(384) evaluation transform (tiling.mode official-center, single crop, no tile voting). Measured on the web-realistic replica this on-distribution input beats native tile voting (pooled held-out BA 0.833 vs 0.813 native-max; lowres TPR 0.76 vs 0.64) and is ~2.5x faster. The hash and size identify the reproducibly exported INT8 browser artifact. url remains null because the frozen native-format B1-B5 permutation battery and paired detector-minus-null gate fail; provenance and INT8 precision are no longer blockers. No CommunityForensics dataset is downloaded or reused.",
+      "bundledPath": "models/community-forensics-384-int8.onnx"
+    }
+  ]
+}
