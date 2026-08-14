@@ -2,11 +2,16 @@
 
 Last updated: 2026-08-14.
 
-**Overall status: not yet ready for a distributable production release.** The
-extension, source build, local inference path, fixed-threshold accuracy,
-INT8-versus-FP32 comparison, and owner-approved redistribution audit pass. The
-frozen native-format nuisance battery fails, so the curve cannot be validated,
-the model URL cannot be configured, and hosted-artifact checks cannot begin.
+**Overall project status: ready for local use and verification.** The extension,
+source build, local inference path, fixed-threshold accuracy, INT8-versus-FP32
+comparison, and owner-approved redistribution audit pass. A local real-model
+build can run the complete detector without a backend or cloud inference.
+
+**Public distribution status: hosted-model release pending.** Under the
+repository's current public-release rules, the frozen native-format nuisance
+battery must pass before the curve is marked `validated`, the model URL is
+configured, and hosted-artifact checks begin. This remaining distribution gate
+does not make the local project or detector implementation incomplete.
 
 A check means the requirement is implemented and supported by current local
 evidence. A construction marker means work or authorization is still required
@@ -21,6 +26,7 @@ before the normal release build can satisfy the requirement.
 | No cloud detector, telemetry, or local backend | ✅ | Browser-only runtime; Python is export/evaluation tooling only; network behavior is documented in `PRIVACY.md` |
 | Automatic first-run model setup | 🚧 | Resume, retry, recovery, OPFS storage, size checking, and SHA-256 verification are implemented; `models/manifest.json` still has `url: null` |
 | Automatically analyze webpage images | ✅ | Mutation/intersection observers, lazy-source handling, frames, shadow roots, CSS backgrounds, candidate tests, and the 262/262 live-site coverage baseline |
+| First real scored badge within 5,000 ms | ✅ | Fresh-profile Edge 151 local-ORT result: 4,402.1 ms from image `load` to the accessible scored badge; fixed gate in `tools/smoke_extension.mjs`; measurement contract in `PERFORMANCE.md` |
 | Real calibrated confidence evidence | ✅ | The exact ORT-Web `official-center` signal has a disjoint calibration fit and a passing fixed-0.65 held-out evaluation in `models/calibration/fused.json` |
 | Calibrated confidence in the normal release build | 🚧 | The curve remains `quarantined` because the frozen native-format nuisance and paired-null gates fail; with no public model URL, the normal build reports setup not configured |
 | Fully reproducible source build | ✅ | `tools/build.mjs` uses unambiguous absolute esbuild entries; `npm run build` passes and the two-build hash comparison is part of final verification |
@@ -96,6 +102,14 @@ repository.
 
 ## Verification commands
 
+The Chrome extension and its normal source build require Node.js only. The
+Python environment is development/evaluation infrastructure, not part of the
+extension runtime. Activate a configured project virtual environment (or
+install `tools/requirements.txt`) before running the Python-backed `test:data`,
+`test:evaluation`, `test:nulls`, and `test:adversarial` commands; the plain
+system Python installation may not include NumPy or the other evaluation
+dependencies.
+
 ```bash
 npm ci
 npm run check
@@ -113,7 +127,8 @@ validated-evidence checks once a public model URL is present.
 
 Current local verification snapshot (2026-08-14):
 
-- `npm run check`: pass (typecheck plus 99 Node tests).
+- `npm run check`: pass (typecheck plus 109 Node tests).
+- Real-ORT first-badge latency: pass at 4,402.1 ms against the fixed 5,000 ms requirement.
 - Calibration, evaluation-contract, data-tool, nuisance-smoke, and adversarial
   fixture suites: pass in their configured Python environments.
 - `npm run assert:shipping`: pass in the expected unconfigured/quarantined

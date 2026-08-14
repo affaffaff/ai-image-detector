@@ -89,6 +89,7 @@ const blobInFlight = new WeakSet();
 
 let enabled = true;
 let started = false;
+let waitingForDocumentRoot = false;
 const modelGate = new ModelGate();
 /** Coalesces MODEL_READY + scored-exit so a double delivery does not bump epoch twice. */
 let rescanQueued = false;
@@ -100,11 +101,14 @@ const staleNoModelRetried = new Set();
 
 /** @type {ShadowRoot | null} */
 let overlayRoot = null;
-// Keep the proven viewport overlay until the native-anchor host is exposed to
-// accessibility and paint hit-testing as reliably as the fallback. Chromium
-// can position the zero-sized wrapper correctly while still pruning its closed
-// shadow contents, which makes a completed scan look like it never ran.
-const nativeAnchorPositioning = false;
+// Anchor-positioned badges move with their images in Chromium's compositor,
+// avoiding the one-frame hitch caused by fixed coordinates updated from a
+// scroll listener. Chrome 116-124 retain the proven viewport-coordinate path.
+const nativeAnchorPositioning =
+  typeof CSS !== 'undefined' &&
+  CSS.supports('anchor-name: --aid-anchor') &&
+  CSS.supports('position-anchor: --aid-anchor') &&
+  CSS.supports('left: anchor(left)');
 let nativeAnchorSeq = 0;
 /**
  * Native anchor positioning lets Chromium move a badge in the same compositor
@@ -375,6 +379,11 @@ function createBadge(host) {
     return badge;
   }
 
+  // positionBadge's hit test treats this single closed-shadow overlay as an
+  // extension-owned node. Create it before that first placement check even
+  // though the native badge itself is hosted by the scrolling container.
+  ensureOverlay();
+
   const anchorName = `--aid-${pageId}-${++nativeAnchorSeq}`;
   const previousInlineAnchorNames = host.style.getPropertyValue('anchor-name');
   const previousInlinePriority = host.style.getPropertyPriority('anchor-name');
@@ -391,8 +400,11 @@ function createBadge(host) {
   wrapper.style.setProperty('position-anchor', anchorName, 'important');
   wrapper.style.setProperty('left', 'anchor(left)', 'important');
   wrapper.style.setProperty('top', 'anchor(top)', 'important');
-  wrapper.style.setProperty('width', '0', 'important');
-  wrapper.style.setProperty('height', '0', 'important');
+  // A zero-sized shadow host can be pruned from paint and the accessibility
+  // tree even while its overflowing child is visible. Give the wrapper its
+  // badge's intrinsic size; absolute positioning keeps it out of page layout.
+  wrapper.style.setProperty('width', 'max-content', 'important');
+  wrapper.style.setProperty('height', 'max-content', 'important');
   wrapper.style.setProperty('overflow', 'visible', 'important');
   wrapper.style.setProperty('pointer-events', 'none', 'important');
   wrapper.style.setProperty('z-index', '2147483647', 'important');
@@ -1312,12 +1324,32 @@ const mo = new MutationObserver((records) => {
 
 function boot() {
   if (started) return;
-  started = true;
   // Wake the service worker and create the offscreen host while the page's
-  // own images are still loading, so the first badge does not wait on WASM.
+  // DOM is still being parsed, so the first badge does not wait on WASM.
   ensurePort();
-  observeImages(document.documentElement);
-  mo.observe(document.documentElement, {
+
+  // document_start runs before Chromium guarantees a documentElement. Warm
+  // the inference path immediately, then attach discovery as soon as the root
+  // exists. The observer still sees every image added after that point.
+  const root = document.documentElement;
+  if (!root) {
+    if (!waitingForDocumentRoot) {
+      waitingForDocumentRoot = true;
+      document.addEventListener(
+        'readystatechange',
+        () => {
+          waitingForDocumentRoot = false;
+          if (enabled) boot();
+        },
+        { once: true },
+      );
+    }
+    return;
+  }
+
+  started = true;
+  observeImages(root);
+  mo.observe(root, {
     childList: true,
     subtree: true,
     attributes: true,

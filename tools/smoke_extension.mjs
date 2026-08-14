@@ -14,6 +14,10 @@ const expectedMode = process.env.AID_EXPECT_MODE ?? 'ort';
 if (!['no-model', 'mock', 'ort'].includes(expectedMode)) {
   throw new Error(`AID_EXPECT_MODE must be no-model, mock, or ort; got '${expectedMode}'`);
 }
+// Product requirement: the first real scored badge on the fixed local fixture
+// must appear within five seconds. This is deliberately not configurable; a
+// slower run must fail instead of moving the acceptance boundary.
+const BADGE_LATENCY_LIMIT_MS = 5_000;
 
 function applyCalibration(raw, table = fusedCalibration) {
   const { xs, ys } = table;
@@ -121,6 +125,7 @@ const injected = await cdp.send(
   {
     expression: `new Promise((resolve, reject) => {
       document.body.innerHTML = '<main><h1>Detector smoke test</h1></main>';
+      document.body.style.minHeight = '2000px';
       const canvas = document.createElement('canvas');
       canvas.width = 384;
       canvas.height = 384;
@@ -139,7 +144,12 @@ const injected = await cdp.send(
       image.width = 384;
       image.height = 384;
       image.style.cssText = 'display:block;width:384px;height:384px';
-      image.onload = () => resolve({url: image.currentSrc, width: image.naturalWidth, height: image.naturalHeight});
+      image.onload = () => resolve({
+        url: image.currentSrc,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        loadedAt: performance.now(),
+      });
       image.onerror = () => reject(new Error('smoke image failed to load'));
       image.src = ${smokeImageDataUrl ? JSON.stringify(smokeImageDataUrl) : "canvas.toDataURL('image/png')"};
       document.querySelector('main').appendChild(image);
@@ -156,6 +166,51 @@ console.error(
     url: String(injected.result?.value?.url ?? '').slice(0, 32) + '…',
   })}`,
 );
+
+async function accessibleText() {
+  const tree = await cdp.send('Accessibility.getFullAXTree', {}, pageSession);
+  return (tree.nodes ?? [])
+    .flatMap((node) => [node.name?.value, node.value?.value, node.description?.value])
+    .filter((value) => typeof value === 'string' && value.length > 0);
+}
+
+// Observe the user-visible result immediately. Running the direct inference
+// verification first would occupy the serialized ORT queue and inflate the
+// badge time with test-only work that a normal page never performs.
+const expectedBadge = await retry(async () => {
+  const text = await accessibleText();
+  if (expectedMode === 'no-model') {
+    const notice = 'AI detector · setup required';
+    if (!text.includes(notice)) {
+      throw new Error(`setup notice is not exposed: ${JSON.stringify(text)}`);
+    }
+    return notice;
+  }
+  if (expectedMode === 'mock') {
+    if (!text.includes('MOCK')) throw new Error(`mock badge is not exposed: ${JSON.stringify(text)}`);
+    return 'MOCK';
+  }
+  const score = text.find((value) => /^(?:AI )?\d+%$/.test(value));
+  if (!score) throw new Error(`scored badge is not exposed: ${JSON.stringify(text)}`);
+  return score;
+}, 30_000);
+
+const badgeObservedAt = await cdp.send(
+  'Runtime.evaluate',
+  { expression: 'performance.now()', returnByValue: true },
+  pageSession,
+);
+const imageLoadedAt = injected.result?.value?.loadedAt;
+const badgeLatencyMs = Number(badgeObservedAt.result?.value) - Number(imageLoadedAt);
+if (!Number.isFinite(badgeLatencyMs) || badgeLatencyMs < 0) {
+  throw new Error(`could not measure badge latency: ${badgeLatencyMs}`);
+}
+console.error(`badge latency: ${badgeLatencyMs.toFixed(1)}ms`);
+if (expectedMode === 'ort' && badgeLatencyMs > BADGE_LATENCY_LIMIT_MS) {
+  throw new Error(
+    `real-ORT badge latency ${badgeLatencyMs.toFixed(1)}ms exceeds ${BADGE_LATENCY_LIMIT_MS}ms requirement`,
+  );
+}
 
 const serviceWorker = await retry(async () => {
   const response = await fetch(`${endpoint}/json`);
@@ -222,30 +277,63 @@ if (expectedMode === 'no-model') {
   );
 }
 
-async function accessibleText() {
-  const tree = await cdp.send('Accessibility.getFullAXTree', {}, pageSession);
-  return (tree.nodes ?? [])
-    .flatMap((node) => [node.name?.value, node.value?.value, node.description?.value])
-    .filter((value) => typeof value === 'string' && value.length > 0);
-}
-
-const expectedBadge = await retry(async () => {
-  const text = await accessibleText();
-  if (expectedMode === 'no-model') {
-    const notice = 'AI detector · setup required';
-    if (!text.includes(notice)) {
-      throw new Error(`setup notice is not exposed: ${JSON.stringify(text)}`);
+if (expectedMode !== 'no-model') {
+  const nativeScroll = await cdp.send(
+    'Runtime.evaluate',
+    {
+      expression: `(() => {
+        const supported =
+          CSS.supports('anchor-name: --aid-anchor') &&
+          CSS.supports('position-anchor: --aid-anchor') &&
+          CSS.supports('left: anchor(left)');
+        if (!supported) return {supported};
+        const image = document.querySelector('#detector-smoke-image');
+        const wrapper = [...document.querySelectorAll('*')].find(
+          (element) => element.style.positionAnchor.startsWith('--aid-')
+        );
+        if (!image || !wrapper) return {supported, wrapperFound: Boolean(wrapper)};
+        const beforeImage = image.getBoundingClientRect();
+        const beforeBadge = wrapper.getBoundingClientRect();
+        scrollTo(0, 100);
+        // Read in the same task: the scroll listener's requestAnimationFrame
+        // has not run, so only compositor/native anchoring can be aligned here.
+        const afterImage = image.getBoundingClientRect();
+        const afterBadge = wrapper.getBoundingClientRect();
+        scrollTo(0, 0);
+        return {
+          supported,
+          wrapperFound: true,
+          width: beforeBadge.width,
+          height: beforeBadge.height,
+          beforeOffset: {
+            x: beforeBadge.left - beforeImage.left,
+            y: beforeBadge.top - beforeImage.top,
+          },
+          afterOffset: {
+            x: afterBadge.left - afterImage.left,
+            y: afterBadge.top - afterImage.top,
+          },
+        };
+      })()`,
+      returnByValue: true,
+    },
+    pageSession,
+  );
+  const result = nativeScroll.result?.value;
+  if (result?.supported) {
+    const aligned = (offset) =>
+      Math.abs(offset?.x - 4) <= 1 && Math.abs(offset?.y - 4) <= 1;
+    if (
+      !result.wrapperFound ||
+      !(result.width > 0 && result.height > 0) ||
+      !aligned(result.beforeOffset) ||
+      !aligned(result.afterOffset)
+    ) {
+      throw new Error(`native badge did not stay compositor-aligned: ${JSON.stringify(result)}`);
     }
-    return notice;
+    console.error(`native badge scroll alignment: ${JSON.stringify(result)}`);
   }
-  if (expectedMode === 'mock') {
-    if (!text.includes('MOCK')) throw new Error(`mock badge is not exposed: ${JSON.stringify(text)}`);
-    return 'MOCK';
-  }
-  const score = text.find((value) => /^(?:AI )?\d+%$/.test(value));
-  if (!score) throw new Error(`scored badge is not exposed: ${JSON.stringify(text)}`);
-  return score;
-}, 30_000);
+}
 
 const pageState = await cdp.send(
   'Runtime.evaluate',
@@ -259,7 +347,9 @@ const pageState = await cdp.send(
         rect: image.getBoundingClientRect().toJSON(),
       })),
       overlayHosts: [...document.documentElement.children].filter(
-        (element) => element.style.zIndex === '2147483647'
+        (element) =>
+          element.style.zIndex === '2147483647' &&
+          element.style.position === 'fixed'
       ).length,
     })`,
     returnByValue: true,
@@ -340,6 +430,10 @@ console.log(
         width: injected.result?.value?.width,
         height: injected.result?.value?.height,
         urlPrefix: String(injected.result?.value?.url ?? '').slice(0, 32) + '…',
+      },
+      performance: {
+        badgeLatencyMs,
+        badgeLatencyLimitMs: expectedMode === 'ort' ? BADGE_LATENCY_LIMIT_MS : null,
       },
       result: {
         urlPrefix: String(result.url).slice(0, 32) + '…',

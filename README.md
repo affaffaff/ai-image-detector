@@ -187,6 +187,12 @@ anonymous CDN fetches, decoding, routing, and badge completion on image-heavy
 public pages. See [`docs/LIVE_COVERAGE.md`](docs/LIVE_COVERAGE.md) for the
 fresh-profile baseline and reproduction command.
 
+**Badge latency** — speed is an acceptance requirement. In real-ORT mode, the
+first scored badge for the fixed local fixture must appear within **5,000 ms**
+of the image `load` event. The browser smoke test enforces the non-configurable
+limit; the measurement contract and current evidence are in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
 **Extension E2E** — release/no-model, dev/mock, and local/ORT browser modes are
 covered by [`tools/smoke_extension.mjs`](tools/smoke_extension.mjs). The passed
 matrix and commands are in [`docs/E2E_TESTS.md`](docs/E2E_TESTS.md).

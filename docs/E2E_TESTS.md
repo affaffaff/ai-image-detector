@@ -10,6 +10,11 @@ fixtures it compares the stored probability to within `1e-6`; for inline
 fixtures, which are intentionally excluded from session storage, it compares
 the visible rounded badge to the calibrated direct result.
 
+The real-ORT mode also enforces the product's badge-latency requirement. Timing
+starts at the fixture image's `load` event and stops when the scored badge is
+exposed in Chromium's accessibility tree. A result above the fixed **5,000 ms**
+ceiling fails the run; see [`PERFORMANCE.md`](PERFORMANCE.md).
+
 ## Completed matrix
 
 Edge 151.0.4129.78, fresh profile per mode, 2026-08-13:
@@ -19,6 +24,9 @@ Edge 151.0.4129.78, fresh profile per mode, 2026-08-13:
 | Release, model URL absent | `no-model` | Pass | `not-configured` status, inference returns `no-model`, setup-required badge, one isolated overlay |
 | Development | `mock` | Pass | deterministic mock inference, explicit `engine: mock`, calibrated scored badge, session memo, one isolated overlay |
 | Local-model verification | `ort` | Pass | real ORT Web WASM inference, calibrated scored badge, session memo, one isolated overlay |
+
+Latest real-ORT latency evidence (Edge 151.0.4129.78, fresh profile,
+2026-08-14): **4,402.1 ms** from image load to scored badge.
 
 The mock implementation is compiled out of the release build. It exists only
 to test pipeline behavior without running the model and is labeled as mock in
