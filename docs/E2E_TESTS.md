@@ -5,8 +5,10 @@ DevTools Protocol. It injects a 384px image into a normal HTTPS page and checks
 the complete path from discovery to the isolated overlay badge.
 
 The smoke test also calls the inference host directly and verifies that the
-badge result stored by the service worker matches the shipped calibration curve
-to within `1e-6`.
+page badge matches the shipped calibration curve. For memoizable HTTP(S)
+fixtures it compares the stored probability to within `1e-6`; for inline
+fixtures, which are intentionally excluded from session storage, it compares
+the visible rounded badge to the calibrated direct result.
 
 ## Completed matrix
 

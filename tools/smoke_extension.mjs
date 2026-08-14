@@ -271,10 +271,30 @@ if (pageState.result?.value?.overlayHosts !== 1) {
   throw new Error(`expected one isolated overlay host: ${JSON.stringify(pageState.result?.value)}`);
 }
 
+const injectedUrl = injected.result?.value?.url;
 const result = expectedMode === 'no-model' ? {
-  url: injected.result?.value?.url,
+  url: injectedUrl,
   update: { state: 'no-model', badge: expectedBadge },
-} : await retry(async () => {
+} : !/^https?:/.test(injectedUrl) ? (() => {
+  // Inline URLs are deliberately excluded from chrome.storage.session: the
+  // URL contains the image bytes and would quickly exhaust the extension's
+  // quota. Validate the visible result against the direct inference instead
+  // of waiting for a memo entry that must never exist.
+  const probability = applyCalibration(directRaw);
+  const isAI = probability >= 0.65;
+  const expectedInlineBadge = expectedMode === 'mock'
+    ? 'MOCK'
+    : `${isAI ? 'AI ' : ''}${Math.round(probability * 100)}%`;
+  if (expectedBadge !== expectedInlineBadge) {
+    throw new Error(
+      `inline badge calibration mismatch: got ${expectedBadge}, expected ${expectedInlineBadge}`,
+    );
+  }
+  return {
+    url: injectedUrl,
+    update: { state: 'scored', probability, isAI, engine: expectedMode },
+  };
+})() : await retry(async () => {
   const evaluated = await workerCdp.send(
     'Runtime.evaluate',
     {
@@ -285,7 +305,7 @@ const result = expectedMode === 'no-model' ? {
   );
   if (evaluated.exceptionDetails) throw new Error('could not read extension session memo');
   const memo = evaluated.result?.value ?? {};
-  const url = injected.result?.value?.url;
+  const url = injectedUrl;
   const stored = memo[url];
   if (!stored) throw new Error('real inference for the injected image has not completed yet');
   if (stored?.update?.state !== 'scored' || stored.update.engine !== expectedMode) {
