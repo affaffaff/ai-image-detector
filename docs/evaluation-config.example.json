@@ -1,0 +1,33 @@
+{
+  "formatVersion": 1,
+  "id": "release-unseen-generator",
+  "scenario": "unseen-generator",
+  "split": "eval",
+  "scoreColumn": "score_official_calibrated",
+  "threshold": 0.65,
+  "expectedModelSha256": "df1aade56566b892178154793bfa95cf5808339d77593ec8137e7c5e306f2035",
+  "calibrationCurve": "../models/calibration/fused.json",
+  "expectedCalibrationCurveSha256": null,
+  "verifyImageFiles": true,
+  "phashDistance": 4,
+  "gates": {
+    "minBalancedAccuracy": 0.75,
+    "requireCiLowerBound": false,
+    "minImagesPerClass": 100,
+    "minClustersPerClass": 100,
+    "minAuditCoverage": 1.0,
+    "requiredDegradations": {
+      "canonical_square_jpeg": {
+        "minImagesPerClass": 25
+      },
+      "social_thumbnail": {
+        "minImagesPerClass": 25
+      }
+    }
+  },
+  "bootstrap": {
+    "samples": 5000,
+    "confidence": 0.95,
+    "seed": 20260814
+  }
+}

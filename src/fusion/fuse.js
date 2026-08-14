@@ -22,7 +22,7 @@
 
 import { MonotoneCalibrator, clampProb, PROB_EPS } from './calibration.js';
 
-/** The bounty fixes this. It is not a tunable. */
+/** Fixed by the product contract; this is not a tunable. */
 export const DECISION_THRESHOLD = 0.65;
 
 /**

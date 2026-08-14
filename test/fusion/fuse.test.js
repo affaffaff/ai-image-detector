@@ -41,7 +41,7 @@ describe('logit / sigmoid', () => {
 });
 
 describe('the fixed threshold', () => {
-  test('DECISION_THRESHOLD is 0.65 — fixed by the bounty, not a tunable', () => {
+  test('DECISION_THRESHOLD is 0.65 — fixed by the product contract', () => {
     assert.equal(DECISION_THRESHOLD, 0.65);
   });
 });

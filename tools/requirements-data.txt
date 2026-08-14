@@ -1,0 +1,13 @@
+# Benchmark-replica data tooling (degradation, pHash dedupe, split, leak audit).
+# Separate from requirements.txt so the calibration path stays minimal and the
+# two environments can be installed independently.
+#
+# Nothing here ships in or runs inside the extension. Offline, CPU, seconds.
+numpy==2.5.2
+scikit-learn==1.9.0
+pillow==12.0.0
+# score_dataset.py runs the exported ONNX artifact to produce benchmark scores.
+# Declared here, not only in requirements-export.txt: reproducing our reported
+# accuracy must not require the ~2GB torch/timm export stack, which exists only
+# to produce the artifact in the first place.
+onnxruntime==1.22.0

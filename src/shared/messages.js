@@ -24,9 +24,12 @@ export const MSG = Object.freeze({
 
   // offscreen -> SW (unsolicited)
   MODEL_PROGRESS: 'model:progress',
+  // SW -> content scripts (all frames): weights just became usable
+  MODEL_READY: 'model:ready',
 
   // popup -> SW
   STATUS_GET: 'status:get',
+  MODEL_RETRY: 'model:retry',
 });
 
 /** Port name for the content-script scan channel. */
@@ -56,6 +59,8 @@ export const TARGET = Object.freeze({
  *
  * @typedef {Object} ScanUpdate
  * @property {string} id
+ * @property {string} [url] - echoed from the request so waiters can settle
+ *                            even if the requesting element has been removed
  * @property {ScanState} state
  * @property {number} [probability]  - final fused P(AI), post-calibration
  * @property {boolean} [isAI]        - probability >= 0.65 (fixed threshold)
@@ -69,15 +74,24 @@ export const TARGET = Object.freeze({
  * @property {number} [raw]          - raw detector score, pre-calibration
  * @property {'ort' | 'mock'} [engine]
  * @property {string} [sha256]       - content hash, memo key
+ * @property {string} [modelSha256]  - exact verified model artifact used
  * @property {number} [ms]
  * @property {string} [error]
+ *
+ * @typedef {Object} InferRequest
+ * @property {string} id
+ * @property {string} url
+ * @property {boolean} allowMock - resolved by the service worker because
+ *                                 offscreen documents only expose chrome.runtime
  *
  * @typedef {'missing' | 'not-configured' | 'downloading' | 'ready' | 'error'} ModelState
  *
  * @typedef {Object} ModelStatus
  * @property {ModelState} state
- * @property {number} [progress]     - 0..1 while downloading
+ * @property {number} [progress]     - durable 0..1 partial progress while incomplete
  * @property {string} [detail]
+ * @property {string} [modelId]
+ * @property {string} [modelSha256]
  */
 
 export {};

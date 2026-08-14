@@ -2,3 +2,4 @@
 # extension. Pinned exactly for reproducibility.
 numpy==2.5.2
 scikit-learn==1.9.0
+pillow==12.0.0

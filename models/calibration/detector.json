@@ -1,0 +1,6 @@
+{
+  "id": "detector-identity-single-signal",
+  "xs": [0, 1],
+  "ys": [0, 1],
+  "fittedOn": "single detector signal; final calibration is applied post-fusion"
+}

@@ -1,7 +1,7 @@
 /**
  * Deterministic extension build: `npm run build` emits dist/, and the same
- * source tree MUST yield byte-identical output on every machine (bounty
- * reproducibility requirement; CI builds twice and diffs).
+ * source tree MUST yield byte-identical output on every machine (the CI build
+ * runs twice and compares hashes).
  *
  * Determinism rules:
  *  - esbuild is exact-pinned; its output embeds no timestamps or paths beyond
@@ -16,6 +16,7 @@
  */
 
 import { build } from 'esbuild';
+import { createHash } from 'node:crypto';
 import {
   cpSync,
   existsSync,
@@ -27,6 +28,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertShippingContract } from './assert_shipping.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = join(ROOT, 'src');
@@ -40,6 +42,13 @@ const DIST = join(ROOT, 'dist');
  * dead-code-eliminates every mock default.
  */
 const DEV = process.argv.includes('--dev');
+const localModelIndex = process.argv.indexOf('--model');
+const LOCAL_MODEL = localModelIndex >= 0 ? process.argv[localModelIndex + 1] : null;
+if (localModelIndex >= 0 && !LOCAL_MODEL) {
+  throw new Error('--model requires a path to an exported ONNX file');
+}
+
+assertShippingContract({ root: ROOT, localTest: Boolean(LOCAL_MODEL) });
 
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(DIST, { recursive: true });
@@ -58,12 +67,18 @@ const bundles = [
 
 for (const b of bundles) {
   await build({
+    absWorkingDir: ROOT,
+    // esbuild 0.28 on Windows can interpret `./src/...` as a package-like
+    // entry and then walk above a restricted workspace while resolving it.
+    // Absolute entry points are unambiguous and do not affect emitted paths
+    // because every bundle already has an explicit outfile.
     entryPoints: [join(SRC, b.entry)],
     outfile: join(DIST, b.out),
     bundle: true,
     format: b.format,
     target: ['chrome116'],
     minify: false, // maintainers audit dist/ against src/ — keep it readable
+    minifySyntax: true, // strips compile-time-false dev/mock paths from releases
     sourcemap: false,
     legalComments: 'inline',
     define: { __DEV_BUILD__: DEV ? 'true' : 'false' },
@@ -79,15 +94,29 @@ const copies = [
   [join(SRC, 'offscreen/offscreen.html'), join(DIST, 'offscreen/offscreen.html')],
   [join(SRC, 'popup/popup.html'), join(DIST, 'popup/popup.html')],
   [join(ROOT, 'models/manifest.json'), join(DIST, 'models/manifest.json')],
+  [
+    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm'),
+    join(DIST, 'ort/ort-wasm-simd-threaded.wasm'),
+  ],
+  [
+    join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs'),
+    join(DIST, 'ort/ort-wasm-simd-threaded.mjs'),
+  ],
 ];
 for (const name of ['icon16.png', 'icon48.png', 'icon128.png']) {
   copies.push([join(SRC, 'icons', name), join(DIST, 'icons', name)]);
 }
-// Fitted calibration curves ship with the extension once they exist.
+const localModelName = 'community-forensics-384-int8.onnx';
+if (LOCAL_MODEL) {
+  if (!existsSync(LOCAL_MODEL)) throw new Error(`local model not found: ${LOCAL_MODEL}`);
+  copies.push([LOCAL_MODEL, join(DIST, 'models', localModelName)]);
+}
+// Explicit production allowlist. Diagnostic/experimental curves (especially
+// center-crop evidence) must never hitch a ride in the package.
 const calDir = join(ROOT, 'models/calibration');
 if (existsSync(calDir)) {
-  for (const f of readdirSync(calDir).sort()) {
-    if (f.endsWith('.json')) copies.push([join(calDir, f), join(DIST, 'calibration', f)]);
+  for (const f of ['detector.json', 'fused.json']) {
+    if (existsSync(join(calDir, f))) copies.push([join(calDir, f), join(DIST, 'calibration', f)]);
   }
 }
 
@@ -97,11 +126,28 @@ for (const [from, to] of copies) {
 }
 
 // Dev builds are labeled in the extension list and popup title.
-if (DEV) {
+if (DEV || LOCAL_MODEL) {
   const path = join(DIST, 'manifest.json');
   const m = JSON.parse(readFileSync(path, 'utf8'));
-  m.name = `${m.name} (DEV — simulated scores)`;
+  m.name = DEV ? `${m.name} (DEV — simulated scores)` : `${m.name} (LOCAL MODEL TEST)`;
   writeFileSync(path, JSON.stringify(m, null, 2) + '\n');
+}
+
+// A local-model build exists only for browser parity verification before the
+// exported artifact is publicly hosted. The ordinary release build never
+// bundles weights and continues to use the automatic setup download flow.
+if (LOCAL_MODEL) {
+  const modelPath = join(DIST, 'models', localModelName);
+  const bytes = readFileSync(modelPath);
+  const manifestPath = join(DIST, 'models', 'manifest.json');
+  const modelManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const primary = modelManifest.models?.[0];
+  if (!primary) throw new Error('models/manifest.json has no primary model entry');
+  primary.url = null;
+  primary.bundledPath = `models/${localModelName}`;
+  primary.bytes = bytes.byteLength;
+  primary.sha256 = createHash('sha256').update(bytes).digest('hex');
+  writeFileSync(manifestPath, JSON.stringify(modelManifest, null, 2) + '\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +171,7 @@ if (missing.length > 0) {
   console.error('manifest references missing files:', missing);
   process.exit(1);
 }
+assertShippingContract({ root: ROOT, dist: DIST, localTest: Boolean(LOCAL_MODEL) });
 
 console.log(
   `built dist/ [${DEV ? 'DEV — mock engine on by default' : 'RELEASE'}] — ` +

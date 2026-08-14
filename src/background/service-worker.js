@@ -14,7 +14,13 @@
 import { fuse, DECISION_THRESHOLD } from '../fusion/fuse.js';
 import { MonotoneCalibrator, IDENTITY_CALIBRATOR } from '../fusion/calibration.js';
 import { MSG, PORT_SCAN, TARGET } from '../shared/messages.js';
-import { ENABLED_FLAG, SCAN_MEMO_MAX } from '../shared/constants.js';
+import {
+  DEV_MOCK_DEFAULT,
+  DEV_MOCK_FLAG,
+  ENABLED_FLAG,
+  SCAN_MEMO_MAX,
+} from '../shared/constants.js';
+import { isSessionMemoizableUrl } from '../shared/inline-payload.js';
 
 /** @typedef {import('../shared/messages.js').ScanRequest} ScanRequest */
 /** @typedef {import('../shared/messages.js').ScanUpdate} ScanUpdate */
@@ -94,7 +100,7 @@ async function loadFusionConfig() {
 //
 // Runtime memoization of images already scanned this session. This is a
 // cache over real inference results, recomputed from pixels every session —
-// explicitly NOT a shipped lookup table (bounty rule 8).
+// explicitly NOT a shipped lookup table.
 
 /** @typedef {Record<string, {update: ScanUpdate, ts: number}>} ScanMemo */
 
@@ -106,6 +112,7 @@ async function memoRead() {
 
 /** @param {string} url @returns {Promise<ScanUpdate | null>} */
 async function memoGet(url) {
+  if (!isSessionMemoizableUrl(url)) return null;
   const scanMemo = await memoRead();
   const hit = scanMemo[url];
   return hit ? { ...hit.update } : null;
@@ -113,6 +120,7 @@ async function memoGet(url) {
 
 /** @param {string} url @param {ScanUpdate} update */
 async function memoPut(url, update) {
+  if (!isSessionMemoizableUrl(url)) return;
   const scanMemo = await memoRead();
   scanMemo[url] = { update: { ...update, id: '' }, ts: Date.now() };
   const keys = Object.keys(scanMemo);
@@ -131,9 +139,16 @@ async function memoPut(url, update) {
 /** @param {ScanRequest} req @returns {Promise<ScanUpdate>} */
 async function scanOne(req) {
   const memoized = await memoGet(req.url);
-  if (memoized) return { ...memoized, id: req.id };
+  if (memoized) return { ...memoized, id: req.id, url: req.url };
 
   await ensureOffscreen();
+
+  // Offscreen documents intentionally expose only chrome.runtime, so all
+  // storage-backed configuration must be resolved here and sent with the job.
+  const stored = await chrome.storage.local.get(DEV_MOCK_FLAG);
+  const mockSetting = stored[DEV_MOCK_FLAG];
+  const allowMock =
+    __DEV_BUILD__ && (mockSetting === undefined ? DEV_MOCK_DEFAULT : Boolean(mockSetting));
 
   /** @type {InferResult} */
   const result = await chrome.runtime.sendMessage({
@@ -141,14 +156,15 @@ async function scanOne(req) {
     target: TARGET.OFFSCREEN,
     id: req.id,
     url: req.url,
+    allowMock,
   });
 
   if (!result.ok) {
     /** @type {ScanUpdate} */
     const update =
       result.error === 'no-model'
-        ? { id: req.id, state: 'no-model' }
-        : { id: req.id, state: 'unscannable', error: result.error };
+        ? { id: req.id, url: req.url, state: 'no-model' }
+        : { id: req.id, url: req.url, state: 'unscannable', error: result.error };
     return update;
   }
 
@@ -158,6 +174,7 @@ async function scanOne(req) {
   /** @type {ScanUpdate} */
   const update = {
     id: req.id,
+    url: req.url,
     state: 'scored',
     probability: fused.probability,
     isAI: fused.probability >= DECISION_THRESHOLD,
@@ -177,7 +194,20 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener(async (msg) => {
     if (msg?.type !== MSG.SCAN_REQUEST) return;
     const { [ENABLED_FLAG]: enabled = true } = await chrome.storage.local.get(ENABLED_FLAG);
-    if (!enabled) return;
+    if (!enabled) {
+      try {
+        port.postMessage({
+          type: MSG.SCAN_UPDATE,
+          id: msg.id,
+          url: msg.url,
+          state: 'unscannable',
+          error: 'disabled',
+        });
+      } catch {
+        /* disconnected */
+      }
+      return;
+    }
 
     try {
       const update = await scanOne(msg);
@@ -188,6 +218,7 @@ chrome.runtime.onConnect.addListener((port) => {
         port.postMessage({
           type: MSG.SCAN_UPDATE,
           id: msg.id,
+          url: msg.url,
           state: 'unscannable',
           error: String(err),
         });
@@ -211,7 +242,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
         const scanMemo = await memoRead();
         sendResponse({ model, scannedThisSession: Object.keys(scanMemo).length });
-      })();
+      })().catch((err) => {
+        sendResponse({
+          model: {
+            state: 'error',
+            detail: err instanceof Error ? err.message : String(err),
+          },
+          scannedThisSession: 0,
+        });
+      });
+      return true;
+    case MSG.MODEL_RETRY:
+      void recoverModel('popup').then(sendResponse).catch((err) => {
+        sendResponse({
+          state: 'error',
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      });
       return true;
     case MSG.MODEL_PROGRESS:
       // Progress events exist for a future setup UI; popup polls for now.
@@ -225,15 +272,82 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Setup: the weight download must be automatic and obvious (the evaluator
 // installs, lets it download, then cuts the network).
 
-chrome.runtime.onInstalled.addListener(() => {
-  void (async () => {
+async function notifyModelReady() {
+  const message = { type: MSG.MODEL_READY };
+  try {
+    await chrome.runtime.sendMessage(message);
+  } catch {
+    /* no extension-page listeners yet */
+  }
+  // runtime.sendMessage misses tabs whose content script is not listening yet
+  // (install/startup recovery often wins that race). Fan out per tab so an
+  // already-open page that latched on a transient no-model still recovers.
+  if (!chrome.tabs?.query || !chrome.tabs?.sendMessage) return;
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(
+      tabs.map((tab) =>
+        tab.id == null
+          ? Promise.resolve()
+          : chrome.tabs.sendMessage(tab.id, message).catch(() => {
+              /* chrome://, Web Store, discarded, or no content script */
+            }),
+      ),
+    );
+  } catch {
+    /* tabs.query can reject in restricted contexts */
+  }
+}
+
+/** @type {Promise<import('../shared/messages.js').ModelStatus> | null} */
+let modelRecoveryPromise = null;
+
+/**
+ * All setup entry points join one recovery flight. The offscreen host also
+ * locks the actual fetch, so this remains safe if the service worker restarts
+ * while a download is still running.
+ *
+ * @param {'installed' | 'startup' | 'popup'} source
+ * @returns {Promise<import('../shared/messages.js').ModelStatus>}
+ */
+function recoverModel(source) {
+  if (modelRecoveryPromise) return modelRecoveryPromise;
+  modelRecoveryPromise = (async () => {
     await ensureOffscreen();
-    const status = await chrome.runtime.sendMessage({
+    let status = await chrome.runtime.sendMessage({
       type: MSG.MODEL_STATUS_GET,
       target: TARGET.OFFSCREEN,
     });
-    if (status?.state === 'missing') {
-      await chrome.runtime.sendMessage({ type: MSG.MODEL_DOWNLOAD, target: TARGET.OFFSCREEN });
+    if (status?.state === 'missing' || status?.state === 'error' || status?.state === 'downloading') {
+      status = await chrome.runtime.sendMessage({
+        type: MSG.MODEL_DOWNLOAD,
+        target: TARGET.OFFSCREEN,
+      });
     }
-  })().catch((err) => console.warn('[setup] model check failed:', err));
+    if (status?.state === 'ready') await notifyModelReady();
+    if (status?.state === 'error') {
+      console.warn(`[setup:${source}] model recovery paused:`, status.detail ?? 'unknown error');
+    }
+    return status;
+  })().finally(() => {
+    modelRecoveryPromise = null;
+  });
+  return modelRecoveryPromise;
+}
+
+function scheduleModelRecovery(/** @type {'installed' | 'startup'} */ source) {
+  void recoverModel(source).catch((err) =>
+    console.warn(
+      `[setup:${source}] model check failed:`,
+      err instanceof Error ? err.message : String(err),
+    ),
+  );
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  scheduleModelRecovery('installed');
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  scheduleModelRecovery('startup');
 });

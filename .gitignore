@@ -1,6 +1,9 @@
-# PRIVATE — briefs, strategy, eval data. Never commit anything from here.
-# See CLAUDE.md: the repo is public from day one; the notes are not.
+# PRIVATE — local AI instructions, strategy, benchmark planning, and eval data.
+# These files stay on the development machine and must never be committed.
+/CLAUDE.md
+/.claude/
 /notes/
+/docs/benchmark-replica.md
 
 # Dependencies and build output
 /node_modules/
@@ -11,7 +14,7 @@
 /models/weights/
 *.onnx
 
-# Eval datasets and score arrays — never committed before submission
+# Eval datasets and score arrays stay private and are never committed
 /data/
 *.npy
 *.npz
@@ -20,6 +23,10 @@
 __pycache__/
 *.py[cod]
 /.venv/
+/.venv-export/
+/.venv-generate/
+/.venv-data/
+/.cache/
 
 # Editor / OS noise
 .DS_Store

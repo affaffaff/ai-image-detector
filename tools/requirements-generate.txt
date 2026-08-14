@@ -1,0 +1,19 @@
+# Local AI-positive generation. GPU only, offline after the first model pull.
+# Nothing here ships in or runs inside the extension.
+#
+# Separate from requirements-export.txt because that env is CPU torch (it only
+# has to convert a checkpoint once) while this one needs CUDA. Installing both
+# into one venv would force a CPU/CUDA torch conflict.
+#
+# CUDA 12.6 wheels: current Windows CUDA stack, and the 2.4 GB cu121 2.5.1
+# wheel stalled/hash-mismatched on this machine. Driver 576.x runs cu126.
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+torch==2.7.1+cu126
+torchvision==0.22.1+cu126
+diffusers==0.35.1
+transformers==4.57.1
+accelerate==1.10.1
+safetensors==0.5.3
+sentencepiece==0.2.1
+Pillow==12.3.0

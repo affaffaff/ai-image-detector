@@ -3,50 +3,312 @@
   <head>
     <meta charset="utf-8" />
     <style>
-      body {
-        font: 13px/1.5 system-ui, sans-serif;
-        width: 280px;
-        margin: 0;
-        padding: 14px;
-        background: #16161a;
-        color: #e8e8ec;
+      :root {
+        --bg: #04070f;
+        --bg-2: #0a1222;
+        --panel: #0b1526;
+        --cyan: #00f0ff;
+        --cyan-dim: #0e7490;
+        --blue: #3b82f6;
+        --magenta: #ff2d78;
+        --green: #00ff9f;
+        --amber: #fbbf24;
+        --text: #c8d4f0;
+        --text-dim: #5b6b8c;
+        --line: rgba(0, 240, 255, 0.16);
+        --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
       }
-      h1 { font-size: 14px; margin: 0 0 10px; }
-      .row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; }
-      .muted { color: #9a9aa4; }
-      .status { font-weight: 600; }
-      .status.ready { color: #4cc38a; }
-      .status.missing, .status.error { color: #e5484d; }
-      .status.not-configured { color: #f0b429; }
-      .status.downloading { color: #6ca8f2; }
-      progress { width: 100%; height: 6px; }
-      .privacy { margin-top: 12px; padding-top: 10px; border-top: 1px solid #2a2a30; color: #9a9aa4; font-size: 11px; }
-      label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
-      .dev { margin-top: 10px; font-size: 11px; color: #9a9aa4; }
+      * { box-sizing: border-box; }
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 0;
+        font: 12px/1.55 var(--mono);
+        background:
+          radial-gradient(120% 85% at 85% -15%, rgba(0, 240, 255, 0.12), transparent 55%),
+          radial-gradient(120% 85% at 0% 115%, rgba(255, 45, 120, 0.08), transparent 55%),
+          var(--bg);
+        color: var(--text);
+        position: relative;
+        overflow: hidden;
+      }
+      /* CRT scanline sweep */
+      body::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        z-index: 20;
+        background: repeating-linear-gradient(
+          0deg,
+          rgba(255, 255, 255, 0.02) 0 1px,
+          transparent 1px 3px
+        );
+      }
+
+      /* ---------- header ---------- */
+      .head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid var(--line);
+        background: linear-gradient(180deg, rgba(0, 240, 255, 0.05), transparent);
+        position: relative;
+      }
+      .head::before,
+      .head::after {
+        content: "";
+        position: absolute;
+        width: 7px;
+        height: 7px;
+        border: 1px solid var(--cyan);
+        opacity: 0.7;
+      }
+      .head::before { top: 6px; left: 6px; border-right: 0; border-bottom: 0; }
+      .head::after { bottom: -1px; right: 6px; border-left: 0; border-top: 0; }
+
+      .logo { display: flex; align-items: center; gap: 9px; }
+      .logo-box {
+        font: 800 15px/1 var(--mono);
+        color: var(--bg);
+        background: linear-gradient(135deg, var(--cyan), var(--blue));
+        padding: 5px 6px 4px;
+        text-shadow: none;
+        box-shadow: 0 0 12px rgba(0, 240, 255, 0.6);
+        letter-spacing: 0;
+      }
+      .logo-txt {
+        font: 700 12px/1.1 var(--mono);
+        color: #eaffff;
+        letter-spacing: 2px;
+        text-shadow: 0 0 8px rgba(0, 240, 255, 0.8);
+      }
+      .logo-sub {
+        display: block;
+        font: 500 8px/1.3 var(--mono);
+        color: var(--text-dim);
+        letter-spacing: 1.6px;
+        margin-top: 2px;
+      }
+      .live {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font: 600 8px/1 var(--mono);
+        color: var(--green);
+        letter-spacing: 1.5px;
+      }
+      .live i {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 8px var(--green);
+        animation: blink 1.4s ease-in-out infinite;
+      }
+      @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+      /* ---------- rows ---------- */
+      .main { padding: 10px 14px 12px; }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 9px 0;
+        gap: 8px;
+      }
+      .k {
+        color: var(--text-dim);
+        font-size: 10px;
+        letter-spacing: 1.4px;
+      }
+      .k::before { content: "▸ "; color: var(--cyan-dim); }
+
+      .status {
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+      .status.ready { color: var(--green); text-shadow: 0 0 8px rgba(0, 255, 159, 0.7); }
+      .status.missing, .status.error { color: var(--magenta); text-shadow: 0 0 8px rgba(255, 45, 120, 0.6); }
+      .status.not-configured { color: var(--amber); text-shadow: 0 0 8px rgba(251, 191, 36, 0.6); }
+      .status.downloading { color: var(--cyan); text-shadow: 0 0 8px rgba(0, 240, 255, 0.7); }
+
+      .counter {
+        font-weight: 700;
+        color: var(--cyan);
+        font-variant-numeric: tabular-nums;
+        text-shadow: 0 0 8px rgba(0, 240, 255, 0.6);
+      }
+
+      /* ---------- progress ---------- */
+      .prog-wrap {
+        margin: 10px 0 2px;
+        display: none;
+        align-items: center;
+        gap: 8px;
+      }
+      .prog-wrap.on { display: flex; }
+      .prog {
+        flex: 1;
+        height: 5px;
+        border: 1px solid rgba(0, 240, 255, 0.4);
+        background: rgba(0, 240, 255, 0.06);
+        position: relative;
+        overflow: hidden;
+      }
+      .prog > i {
+        position: absolute;
+        inset: 0;
+        transform-origin: left;
+        background: linear-gradient(90deg, var(--blue), var(--cyan));
+        box-shadow: 0 0 10px rgba(0, 240, 255, 0.8);
+        animation: fill 0.3s ease-out;
+      }
+      @keyframes fill { from { transform: scaleX(0); } }
+      .prog-pct {
+        font-size: 10px;
+        color: var(--cyan);
+        min-width: 34px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .model-detail {
+        display: none;
+        margin: 7px 0 0;
+        color: var(--text-dim);
+        font-size: 9px;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+      }
+      .model-detail.on { display: block; }
+
+      .retry {
+        display: none;
+        width: 100%;
+        margin: 9px 0 2px;
+        padding: 7px 10px;
+        border: 1px solid var(--magenta);
+        background: rgba(255, 45, 120, 0.08);
+        color: #ffd9e7;
+        font: 700 10px/1.2 var(--mono);
+        letter-spacing: 1.2px;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+      .retry.on { display: block; }
+      .retry:hover { background: rgba(255, 45, 120, 0.16); }
+      .retry:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+      .retry:disabled { cursor: wait; opacity: 0.55; }
+
+      /* ---------- cyberpunk toggle ---------- */
+      .switch { position: relative; display: inline-block; cursor: pointer; }
+      .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .switch .track {
+        display: block;
+        width: 36px;
+        height: 17px;
+        border: 1px solid rgba(0, 240, 255, 0.35);
+        background: rgba(0, 240, 255, 0.07);
+        transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+        position: relative;
+      }
+      .switch .track::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 11px;
+        height: 11px;
+        background: var(--text-dim);
+        transition: transform 0.15s, background 0.15s, box-shadow 0.15s;
+      }
+      .switch input:checked + .track {
+        background: rgba(0, 240, 255, 0.14);
+        border-color: var(--cyan);
+        box-shadow: 0 0 10px rgba(0, 240, 255, 0.5), inset 0 0 6px rgba(0, 240, 255, 0.2);
+      }
+      .switch input:checked + .track::after {
+        transform: translateX(19px);
+        background: var(--cyan);
+        box-shadow: 0 0 8px var(--cyan);
+      }
+      .switch input:focus-visible + .track { outline: 1px solid var(--cyan); outline-offset: 2px; }
+
+      /* ---------- dev ---------- */
+      .dev {
+        margin-top: 12px;
+        padding: 8px 10px;
+        font-size: 10px;
+        color: var(--amber);
+        border: 1px dashed rgba(251, 191, 36, 0.4);
+        background: rgba(251, 191, 36, 0.05);
+      }
+      .dev label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+      .dev input { accent-color: var(--amber); }
+
+      /* ---------- footer ---------- */
+      .privacy {
+        margin-top: 12px;
+        padding: 9px 14px 11px;
+        border-top: 1px solid var(--line);
+        color: var(--text-dim);
+        font-size: 10px;
+        line-height: 1.6;
+        position: relative;
+      }
+      .privacy::before {
+        content: "◆ OFF-CHIP EXFILTRATION: NONE";
+        display: block;
+        font-size: 8px;
+        letter-spacing: 1.5px;
+        color: rgba(0, 240, 255, 0.55);
+        margin-bottom: 4px;
+      }
     </style>
   </head>
   <body>
-    <h1>AI Image Detector</h1>
-    <div class="row">
-      <span class="muted">Detection</span>
-      <label><input type="checkbox" id="enabled" /> enabled</label>
+    <header class="head">
+      <div class="logo">
+        <span class="logo-box">AI</span>
+        <span class="logo-txt">IMAGE DETECTOR<span class="logo-sub">NEURAL FORENSICS // ON-DEVICE</span></span>
+      </div>
+      <span class="live"><i></i>LIVE</span>
+    </header>
+
+    <div class="main">
+      <div class="row">
+        <span class="k">Detection</span>
+        <label class="switch" title="Enable or disable image scanning">
+          <input type="checkbox" id="enabled" />
+          <span class="track"></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="k">Model</span>
+        <span class="status" id="model-state">…</span>
+      </div>
+      <div class="prog-wrap" id="prog-wrap">
+        <div class="prog"><i id="model-progress-fill"></i></div>
+        <span class="prog-pct" id="model-progress-pct">0%</span>
+      </div>
+      <div class="model-detail" id="model-detail" role="status"></div>
+      <button class="retry" id="model-retry" type="button">Retry model download</button>
+      <div class="row">
+        <span class="k">Scanned this session</span>
+        <span class="counter" id="scanned">…</span>
+      </div>
+      <div class="dev" id="dev-controls" hidden>
+        <label><input type="checkbox" id="dev-mock" /> dev: mock engine (labeled, not real inference)</label>
+      </div>
     </div>
-    <div class="row">
-      <span class="muted">Model</span>
-      <span class="status" id="model-state">…</span>
-    </div>
-    <progress id="model-progress" max="1" value="0" hidden></progress>
-    <div class="row">
-      <span class="muted">Scanned this session</span>
-      <span id="scanned">…</span>
-    </div>
-    <div class="dev">
-      <label><input type="checkbox" id="dev-mock" /> developer: mock engine (labeled, not real inference)</label>
-    </div>
-    <div class="privacy">
+
+    <footer class="privacy">
       Every image is analyzed on this device. Nothing — no pixels, URLs, or
       scores — ever leaves your browser.
-    </div>
+    </footer>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

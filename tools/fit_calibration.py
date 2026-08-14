@@ -7,7 +7,8 @@ extension loads at runtime (src/fusion/calibration.js).
 
 Two steps, composed into one shipped curve:
 
-  1. Isotonic regression maps raw scores to true empirical P(AI | score).
+  1. Regularized Platt scaling maps the detector's log-odds to an empirical
+     P(AI | score) without isotonic's 0/1 collapse on separable small sets.
   2. A piecewise-linear shift sends the balanced-accuracy-optimal threshold t*
      to 0.65, stretching [0, t*] onto [0, 0.65] and [t*, 1] onto [0.65, 1].
 
@@ -35,9 +36,12 @@ import pathlib
 import sys
 
 import numpy as np
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+
+from eval_common import sha256_file
 
 TARGET_THRESHOLD = 0.65
+PROB_EPS = 1e-6
 
 
 def balanced_accuracy(labels: np.ndarray, scores: np.ndarray, thr: float) -> float:
@@ -78,6 +82,33 @@ def shift_to_target(y: np.ndarray, t_star: float, target: float = TARGET_THRESHO
     return np.clip(out, 0.0, 1.0)
 
 
+def score_logit(scores: np.ndarray) -> np.ndarray:
+    clipped = np.clip(scores.astype(np.float64), PROB_EPS, 1.0 - PROB_EPS)
+    return np.log(clipped / (1.0 - clipped))
+
+
+def fit_platt(scores: np.ndarray, labels: np.ndarray) -> LogisticRegression:
+    model = LogisticRegression(C=1.0, class_weight="balanced", solver="lbfgs", random_state=0)
+    model.fit(score_logit(scores)[:, None], labels)
+    slope = float(model.coef_.reshape(-1)[0])
+    if slope <= 0:
+        raise ValueError(f"detector ranking is inverted or unusable (Platt slope {slope:.6f})")
+    return model
+
+
+def platt_predict(model: LogisticRegression, scores: np.ndarray) -> np.ndarray:
+    return model.predict_proba(score_logit(scores)[:, None])[:, 1]
+
+
+def raw_score_at_platt_probability(model: LogisticRegression, probability: float) -> float:
+    probability = float(np.clip(probability, PROB_EPS, 1.0 - PROB_EPS))
+    target_logit = np.log(probability / (1.0 - probability))
+    slope = float(model.coef_.reshape(-1)[0])
+    intercept = float(model.intercept_.reshape(-1)[0])
+    raw_logit = (target_logit - intercept) / slope
+    return float(1.0 / (1.0 + np.exp(-raw_logit)))
+
+
 def thin(xs: np.ndarray, ys: np.ndarray, max_knots: int) -> tuple[np.ndarray, np.ndarray]:
     """Drop collinear interior points, then subsample to max_knots."""
     keep = [0]
@@ -92,29 +123,67 @@ def thin(xs: np.ndarray, ys: np.ndarray, max_knots: int) -> tuple[np.ndarray, np
     return xs[idx], ys[idx]
 
 
+def platt_shift_curve(
+    raw: np.ndarray,
+    labels: np.ndarray,
+    max_knots: int,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    model = fit_platt(raw, labels)
+    calibrated = platt_predict(model, raw)
+    t_star, ba_star = best_threshold(labels, calibrated)
+    raw_anchor = raw_score_at_platt_probability(model, t_star)
+    near_zero = np.geomspace(PROB_EPS, 0.1, 160)
+    grid = np.unique(np.concatenate((
+        np.asarray([0.0, raw_anchor, 1.0]),
+        near_zero,
+        np.linspace(0.0, 1.0, 512),
+        1.0 - near_zero,
+    )))
+    shifted = shift_to_target(platt_predict(model, grid), t_star)
+    xs, ys = thin(grid, shifted, max(2, max_knots - 1))
+    # Preserve the exact operating-point anchor after thinning.
+    if not np.any(np.isclose(xs, raw_anchor, atol=1e-12, rtol=0.0)):
+        position = int(np.searchsorted(xs, raw_anchor))
+        xs = np.insert(xs, position, raw_anchor)
+        ys = np.insert(ys, position, TARGET_THRESHOLD)
+    else:
+        ys[np.argmin(np.abs(xs - raw_anchor))] = TARGET_THRESHOLD
+    return xs, ys, t_star, ba_star
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scores", required=True, help=".npy raw scores (calibration split)")
     ap.add_argument("--labels", required=True, help=".npy labels, 1 = AI")
     ap.add_argument("--eval-scores", help=".npy raw scores (held-out report split)")
     ap.add_argument("--eval-labels", help=".npy labels for the report split")
+    ap.add_argument("--calibration-split-id", default="calibration")
+    ap.add_argument("--eval-split-id", default="eval")
     ap.add_argument("--id", default="unnamed", help="signal identifier")
     ap.add_argument("--max-knots", type=int, default=64)
     ap.add_argument("--out", required=True, type=pathlib.Path)
     args = ap.parse_args()
 
+    if bool(args.eval_scores) != bool(args.eval_labels):
+        sys.exit("--eval-scores and --eval-labels must be provided together")
+    if args.eval_scores:
+        if args.calibration_split_id == args.eval_split_id:
+            sys.exit("calibration and eval split ids must be different")
+        calibration_paths = {pathlib.Path(args.scores).resolve(), pathlib.Path(args.labels).resolve()}
+        eval_paths = {pathlib.Path(args.eval_scores).resolve(), pathlib.Path(args.eval_labels).resolve()}
+        if calibration_paths & eval_paths:
+            sys.exit("calibration and eval arrays must be separate artifacts")
+        if sha256_file(pathlib.Path(args.scores)) == sha256_file(pathlib.Path(args.eval_scores)):
+            sys.exit("calibration and eval score arrays have identical content")
     raw = np.load(args.scores).astype(np.float64).ravel()
     lab = np.load(args.labels).astype(int).ravel()
     if raw.shape != lab.shape:
         sys.exit("scores and labels must be the same length")
 
-    # --- step 1: isotonic ----------------------------------------------------
-    iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
-    iso.fit(raw, lab)
-    cal = iso.predict(raw)
-
-    # --- step 2: locate and move the boundary --------------------------------
-    t_star, ba_star = best_threshold(lab, cal)
+    # --- fit Platt scale, locate boundary, and compose the shipped curve -----
+    platt = fit_platt(raw, lab)
+    cal = platt_predict(platt, raw)
+    xs, ys, t_star, ba_star = platt_shift_curve(raw, lab, args.max_knots)
     print(f"[{args.id}] optimal threshold on calibrated scores: {t_star:.4f}  BA={ba_star:.4f}")
     if t_star < 0.02 or t_star > 0.98:
         print("  WARNING: optimal threshold is near an endpoint. The remap will be", file=sys.stderr)
@@ -122,11 +191,6 @@ def main() -> int:
 
     ba_naive = balanced_accuracy(lab, cal, TARGET_THRESHOLD)
     print(f"[{args.id}] BA at 0.65 WITHOUT the shift: {ba_naive:.4f}  (delta {ba_star - ba_naive:+.4f})")
-
-    # --- compose into one shipped curve --------------------------------------
-    grid = np.linspace(raw.min(), raw.max(), 512)
-    ys = shift_to_target(iso.predict(grid), t_star)
-    xs, ys = thin(grid, ys, args.max_knots)
 
     assert np.all(np.diff(xs) > 0), "xs must be strictly increasing"
     assert np.all(np.diff(ys) >= -1e-12), "ys must be non-decreasing"
@@ -139,6 +203,9 @@ def main() -> int:
         "n": int(raw.size),
         "tStar": round(t_star, 6),
         "target": TARGET_THRESHOLD,
+        "calibrationSplit": args.calibration_split_id,
+        "calibrationScoresSha256": sha256_file(pathlib.Path(args.scores)),
+        "calibrationLabelsSha256": sha256_file(pathlib.Path(args.labels)),
     }
 
     # --- honest report on untouched data -------------------------------------
@@ -146,9 +213,16 @@ def main() -> int:
         ev_raw = np.load(args.eval_scores).astype(np.float64).ravel()
         ev_lab = np.load(args.eval_labels).astype(int).ravel()
         ev_cal = np.interp(ev_raw, xs, ys, left=ys[0], right=ys[-1])
+        if ev_raw.shape != ev_lab.shape:
+            sys.exit("eval scores and labels must be the same length")
+        if set(np.unique(ev_lab)) != {0, 1}:
+            sys.exit("eval labels must contain both classes")
         ba_eval = balanced_accuracy(ev_lab, ev_cal, TARGET_THRESHOLD)
         print(f"[{args.id}] HELD-OUT BA at 0.65 after shift: {ba_eval:.4f}   <-- the number that counts")
         table["heldOutBA"] = round(ba_eval, 6)
+        table["evalSplit"] = args.eval_split_id
+        table["evalScoresSha256"] = sha256_file(pathlib.Path(args.eval_scores))
+        table["evalLabelsSha256"] = sha256_file(pathlib.Path(args.eval_labels))
     else:
         print("  NOTE: no held-out set given. The numbers above are fit-set optimistic.", file=sys.stderr)
 

@@ -6,21 +6,41 @@
  * Pixel access happens elsewhere: cross-origin canvas is tainted, so the
  * offscreen document fetches bytes itself. This script only observes the DOM.
  *
- * Engineering notes (each one is a competitor's shipped bug, avoided here):
+ * Engineering notes for common browser-scanning failure modes:
  *  - Viewport prioritization is real: scans are requested from the
  *    IntersectionObserver callback only. There is no "querySelectorAll and
  *    queue everything" path that defeats it.
  *  - Per-element state lives in a WeakMap; removed images are swept and their
  *    badges removed — no unbounded growth on infinite-scroll pages.
- *  - Badges live in a closed shadow root so page CSS cannot restyle them, and
- *    are repositioned on capture-phase scroll events so nested scroll
- *    containers do not cause drift.
+ *  - Badges live in a closed shadow root so page CSS cannot restyle them. They
+ *    use viewport-fixed coordinates and are repositioned on capture-phase
+ *    scroll events so page and nested scrollers cannot use different origins.
  *  - The scan port reconnects and re-requests pending images when the MV3
  *    service worker dies mid-scan.
  */
 
-import { MSG, PORT_SCAN } from '../shared/messages.js';
-import { MIN_IMAGE_EDGE, VIEWPORT_MARGIN, ENABLED_FLAG, DEV_BUILD } from '../shared/constants.js';
+import { MSG, PORT_SCAN, TARGET } from '../shared/messages.js';
+import {
+  MIN_IMAGE_EDGE,
+  VIEWPORT_MARGIN,
+  ENABLED_FLAG,
+  DEV_BUILD,
+  URL_CACHE_MAX,
+} from '../shared/constants.js';
+import { MAX_INLINE_SCAN_BYTES } from '../shared/inline-payload.js';
+import {
+  classifyImageCandidate,
+  classifyPaintedCandidate,
+  cssBackgroundUrls,
+  fittedImageRect,
+  isHostTopmostAtPoint,
+  isBackgroundWatchTag,
+  resetImageObservation,
+  shouldRenderBadge,
+  shouldSuppressDuplicateBadge,
+} from './candidate.js';
+import { UrlRegistry } from './url-registry.js';
+import { ModelGate } from './model-gate.js';
 
 /** @typedef {import('../shared/messages.js').ScanUpdate} ScanUpdate */
 
@@ -31,21 +51,44 @@ import { MIN_IMAGE_EDGE, VIEWPORT_MARGIN, ENABLED_FLAG, DEV_BUILD } from '../sha
  * @property {'pending' | 'scored' | 'unscannable' | 'no-model' | 'skipped'} phase
  * @property {HTMLElement | null} badge
  * @property {ScanUpdate | null} update
+ * @property {number} epoch
+ */
+
+/**
+ * @typedef {Object} RenderedBadge
+ * @property {string} id
+ * @property {string} phase
+ * @property {string} url
+ * @property {boolean} isImage
+ * @property {{left: number, top: number, right: number, bottom: number}} host
+ * @property {{left: number, top: number, right: number, bottom: number}} badge
+ * @property {HTMLElement} element
  */
 
 let seq = 0;
 const pageId = Math.random().toString(36).slice(2, 8);
+/** Bumped on teardown and on model-ready so already-seen images are eligible again. */
+let epoch = 0;
 
-/** @type {WeakMap<HTMLImageElement, ImgState>} */
+/** @type {WeakMap<HTMLElement, ImgState>} */
 const states = new WeakMap();
-/** @type {Map<string, HTMLImageElement>} */
+/** @type {Map<string, HTMLElement>} */
 const byId = new Map();
-/** @type {Map<string, ScanUpdate>} */
-const urlCache = new Map();
-/** @type {Map<string, Set<string>>} */
-const pendingByUrl = new Map();
+/** Bounded per-URL result cache + in-flight bookkeeping. See url-registry.js. */
+const registry = new UrlRegistry(URL_CACHE_MAX);
+/** @type {WeakSet<HTMLImageElement>} */
+const waitingForLoad = new WeakSet();
+/** @type {WeakMap<HTMLImageElement, {src: string, dataUrl: string}>} */
+const blobResolved = new WeakMap();
+/** @type {WeakSet<HTMLImageElement>} */
+const blobInFlight = new WeakSet();
 
 let enabled = true;
+const modelGate = new ModelGate();
+/** Coalesces MODEL_READY + scored-exit so a double delivery does not bump epoch twice. */
+let rescanQueued = false;
+/** URLs already retried after a stale no-model while the model is proven usable. */
+const staleNoModelRetried = new Set();
 
 // ---------------------------------------------------------------------------
 // Badge overlay (closed shadow root; page CSS cannot reach in)
@@ -56,37 +99,112 @@ let overlayRoot = null;
 function ensureOverlay() {
   if (overlayRoot) return overlayRoot;
   const host = document.createElement('div');
-  host.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;z-index:2147483647;';
+  host.style.cssText =
+    'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
   overlayRoot = host.attachShadow({ mode: 'closed' });
   const style = document.createElement('style');
   style.textContent = `
     .badge {
-      position: absolute;
-      font: 600 11px/1.6 system-ui, sans-serif;
-      color: #fff;
+      position: fixed;
+      font: 700 10px/1.7 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      color: #eaffff;
+      letter-spacing: .4px;
       padding: 0 7px;
-      border-radius: 9px;
+      border-radius: 3px;
+      border: 1px solid transparent;
       pointer-events: auto;
       cursor: default;
       white-space: nowrap;
-      box-shadow: 0 1px 4px rgba(0,0,0,.35);
       user-select: none;
+      backdrop-filter: blur(2px);
     }
-    .pending { background: rgba(90,90,96,.85); }
-    .ai      { background: rgba(196,42,42,.92); }
-    .real    { background: rgba(34,122,84,.92); }
-    .setup   { background: rgba(178,124,0,.92); }
-    .mock    { outline: 2px dashed rgba(255,255,255,.75); }
+    .badge::before {
+      content: "";
+      position: absolute;
+      top: 1px; left: 1px;
+      width: 4px; height: 4px;
+      border-top: 1px solid currentColor;
+      border-left: 1px solid currentColor;
+      opacity: .85;
+      pointer-events: none;
+    }
+    .ai {
+      background: rgba(30,4,18,.88);
+      color: #ff4d8d;
+      border-color: rgba(255,45,120,.85);
+      box-shadow: 0 0 10px rgba(255,45,120,.45), inset 0 0 6px rgba(255,45,120,.18);
+    }
+    .real {
+      background: rgba(2,16,14,.88);
+      color: #00ff9f;
+      border-color: rgba(0,255,159,.7);
+      box-shadow: 0 0 8px rgba(0,255,159,.35), inset 0 0 6px rgba(0,255,159,.14);
+    }
+    .mock {
+      background: rgba(4,7,15,.88);
+      color: #00f0ff;
+      border-color: rgba(0,240,255,.6);
+      box-shadow: 0 0 8px rgba(0,240,255,.25);
+    }
+    .setup {
+      background: rgba(18,12,2,.88);
+      color: #ffd257;
+      border-color: rgba(251,191,36,.75);
+      box-shadow: 0 0 8px rgba(251,191,36,.35);
+    }
+    .setup-notice {
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      max-width: min(280px, calc(100vw - 28px));
+      box-sizing: border-box;
+      background: rgba(18,12,2,.94);
+      color: #ffd257;
+      font: 700 11px/1.45 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      letter-spacing: .25px;
+      padding: 8px 11px;
+      border: 1px solid rgba(251,191,36,.7);
+      border-radius: 4px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.38), 0 0 8px rgba(251,191,36,.2);
+      pointer-events: none;
+    }
+    .badge.scored { cursor: pointer; }
+    .popover {
+      position: fixed;
+      min-width: 200px;
+      max-width: 280px;
+      background: rgba(5,9,20,.97);
+      color: #c8d4f0;
+      font: 11px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      padding: 10px 12px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,240,255,.45);
+      box-shadow: 0 0 18px rgba(0,240,255,.22), 0 4px 18px rgba(0,0,0,.55);
+      pointer-events: auto;
+      z-index: 1;
+    }
+    .popover > div:first-child {
+      color: #00f0ff;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: .5px;
+      text-shadow: 0 0 8px rgba(0,240,255,.6);
+      margin-bottom: 2px;
+    }
+    .popover .k { color: #5b6b8c; letter-spacing: .3px; }
+    .popover .bits { color: #00f0ff; font-variant-numeric: tabular-nums; }
     .hud {
       position: fixed;
-      bottom: 8px;
-      left: 8px;
-      background: rgba(20,20,26,.92);
-      color: #f0b429;
-      font: 600 11px/1.8 ui-monospace, monospace;
-      padding: 0 10px;
-      border-radius: 10px;
-      border: 1px solid rgba(240,180,41,.4);
+      bottom: 10px;
+      left: 10px;
+      background: rgba(4,7,15,.94);
+      color: #00f0ff;
+      font: 600 11px/1.8 ui-monospace, Consolas, "Cascadia Mono", monospace;
+      letter-spacing: 1px;
+      padding: 0 12px;
+      border-radius: 2px;
+      border: 1px solid rgba(0,240,255,.5);
+      box-shadow: 0 0 12px rgba(0,240,255,.3);
       pointer-events: none;
     }
   `;
@@ -95,55 +213,320 @@ function ensureOverlay() {
   return overlayRoot;
 }
 
-/** @param {HTMLImageElement} img @param {ImgState} state */
-function renderBadge(img, state) {
+/** @param {HTMLElement} el @param {ImgState} state */
+function renderBadge(el, state) {
+  const u = state.update;
+  if (!shouldRenderBadge(state.phase, u?.probability, window !== top)) {
+    // Pending work is intentionally silent. Rendering an ellipsis immediately
+    // for every candidate turns image search and gallery pages into a field of
+    // extension controls, and layered preview images can briefly show several.
+    state.badge?.remove();
+    state.badge = null;
+    if (openPopover?.state === state) closePopover();
+    scheduleBadgeCollisionReconcile();
+    return;
+  }
+
   const root = ensureOverlay();
   if (!state.badge) {
     state.badge = document.createElement('div');
     root.appendChild(state.badge);
   }
   const b = state.badge;
-  const u = state.update;
+  b.onclick = null;
 
-  if (state.phase === 'pending') {
-    b.className = 'badge pending';
-    b.textContent = '…';
-    b.title = 'Analyzing on-device';
-  } else if (state.phase === 'scored' && u && typeof u.probability === 'number') {
-    const pct = Math.round(u.probability * 100);
-    b.className = `badge ${u.isAI ? 'ai' : 'real'}${u.engine === 'mock' ? ' mock' : ''}`;
-    b.textContent = u.isAI ? `AI ${pct}%` : `${pct}%`;
-    b.title =
-      (u.engine === 'mock' ? 'DEV MOCK — not real inference\n' : '') +
-      `P(AI-generated) = ${pct}% — analyzed on-device` +
-      (u.contributions?.length
-        ? '\n' + u.contributions.map((c) => `${c.name}: ${c.bits.toFixed(2)} bits`).join('\n')
-        : '');
-  } else if (state.phase === 'no-model') {
+  if (state.phase === 'no-model') {
     b.className = 'badge setup';
-    b.textContent = 'setup';
-    b.title = 'Model weights not installed yet — open the extension popup';
-  } else {
-    // unscannable/skipped: no badge noise on broken or trivial images
-    b.remove();
-    state.badge = null;
-    return;
+    b.textContent = 'SETUP';
+    b.title = 'Open the extension popup to install the on-device model';
+  } else if (u && typeof u.probability === 'number') {
+    const pct = Math.round(u.probability * 100);
+    const mock = u.engine === 'mock';
+    b.className = `badge scored ${mock ? 'mock' : u.isAI ? 'ai' : 'real'}`;
+    b.textContent = mock ? 'MOCK' : u.isAI ? `AI ${pct}%` : `${pct}%`;
+    b.title = mock ? 'Simulated pipeline result — not an AI verdict' : 'Click for on-device score details';
+    b.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      togglePopover(el, state);
+    };
   }
-  positionBadge(img, b);
+  const visible = positionBadge(el, b);
+  scheduleBadgeCollisionReconcile();
+  if (openPopover?.state === state) {
+    if (visible) positionPopover(el, openPopover.el);
+    else closePopover();
+  }
 }
 
 let loggedFirstBadge = false;
+/** @type {HTMLElement | null} */
+let setupNotice = null;
 
-/** @param {HTMLImageElement} img @param {HTMLElement} badge */
-function positionBadge(img, badge) {
-  const rect = img.getBoundingClientRect();
-  if (rect.width === 0 && rect.height === 0) {
-    badge.style.display = 'none';
+function showSetupNotice() {
+  if (window !== top || setupNotice) return;
+  setupNotice = document.createElement('div');
+  setupNotice.className = 'setup-notice';
+  setupNotice.textContent = 'AI detector · setup required';
+  setupNotice.title = 'Open the extension popup to install the on-device model';
+  ensureOverlay().appendChild(setupNotice);
+}
+
+function clearSetupNotice() {
+  setupNotice?.remove();
+  setupNotice = null;
+}
+
+function enterModelUnavailableState() {
+  if (!modelGate.enter()) return;
+  // Do not registry.reset() here. Other URLs are still in flight in the
+  // service worker; dropping their waiters would strand duplicate <img>s on
+  // the same URL when those jobs later score. Port disconnect is the only
+  // place in-flight is actually stale.
+  closePopover();
+  for (const [, el] of byId) {
+    const state = states.get(el);
+    if (!state || (state.phase !== 'pending' && state.phase !== 'no-model')) continue;
+    state.phase = 'no-model';
+    renderBadge(el, state);
+  }
+  showSetupNotice();
+  void probeModelReadiness();
+}
+
+function applyModelReady() {
+  staleNoModelRetried.clear();
+  const alreadyProven = modelGate.provenUsable;
+  const wasLatched = modelGate.markUsable();
+  clearSetupNotice();
+  // Skip the epoch bump when this tab already has scored badges — startup
+  // recovery rebroadcasts MODEL_READY whenever weights are on disk.
+  if (wasLatched || !alreadyProven) scheduleRescanVisible();
+}
+
+/**
+ * Ask the service worker whether weights are already usable. Recovers a tab
+ * that latched on `no-model` after MODEL_READY was broadcast with no listener.
+ * @returns {Promise<'already' | 'recovered' | 'unavailable'>}
+ */
+function probeModelReadiness() {
+  if (modelGate.provenUsable) return Promise.resolve('already');
+  return new Promise((resolve) => {
+    let settled = false;
+    /** @param {'already' | 'recovered' | 'unavailable'} status */
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      resolve(status);
+    };
+    try {
+      chrome.runtime.sendMessage({ type: MSG.STATUS_GET, target: TARGET.SW }, (response) => {
+        void chrome.runtime.lastError;
+        if (response?.model?.state === 'ready') {
+          applyModelReady();
+          finish('recovered');
+          return;
+        }
+        finish('unavailable');
+      });
+    } catch {
+      finish('unavailable');
+    }
+  });
+}
+
+function scheduleRescanVisible() {
+  if (rescanQueued) return;
+  rescanQueued = true;
+  queueMicrotask(() => {
+    rescanQueued = false;
+    rescanVisible();
+  });
+}
+
+/** A scored verdict means weights are usable, even if MODEL_READY was missed. */
+function onModelBecameUsable() {
+  const firstProof = !modelGate.provenUsable;
+  const wasLatched = modelGate.markUsable();
+  if (firstProof) staleNoModelRetried.clear();
+  if (!wasLatched) return;
+  clearSetupNotice();
+  scheduleRescanVisible();
+}
+
+/**
+ * A no-model reply that lost the race with a scored verdict or MODEL_READY.
+ * Re-queue that URL once; never re-latch or demote images that already scored.
+ * @param {string} url
+ * @param {string} fallbackId
+ */
+function retryStaleNoModel(url, fallbackId) {
+  const waiters = registry.settle(url, fallbackId);
+  const already = staleNoModelRetried.has(url);
+  if (!already) staleNoModelRetried.add(url);
+
+  for (const id of waiters) {
+    const el = byId.get(id);
+    const state = el && states.get(el);
+    if (!el || !state || state.phase === 'scored') continue;
+    if (already) {
+      state.phase = 'no-model';
+      renderBadge(el, state);
+      continue;
+    }
+    state.phase = 'pending';
+    requestScan(el, state);
+  }
+}
+
+/** @type {{state: ImgState, el: HTMLElement, host: HTMLElement} | null} */
+let openPopover = null;
+
+function closePopover() {
+  openPopover?.el.remove();
+  openPopover = null;
+}
+
+/** @param {HTMLElement} host @param {ImgState} state */
+function togglePopover(host, state) {
+  if (openPopover?.state === state) {
+    closePopover();
     return;
   }
+  closePopover();
+  const u = state.update;
+  if (!u || typeof u.probability !== 'number') return;
+  const root = ensureOverlay();
+  const pop = document.createElement('div');
+  pop.className = 'popover';
+  const pct = Math.round(u.probability * 100);
+  /**
+   * @param {string} text
+   * @param {string} [className]
+   */
+  const add = (text, className) => {
+    const row = document.createElement('div');
+    if (className) row.className = className;
+    row.textContent = text;
+    pop.appendChild(row);
+  };
+  if (u.engine === 'mock') {
+    add('MOCK PIPELINE');
+    add('Simulated test only — not an AI verdict', 'k');
+    add('Use the local-model build for real on-device scores.', 'k');
+    pop.addEventListener('click', (ev) => ev.stopPropagation());
+    root.appendChild(pop);
+    openPopover = { state, el: pop, host };
+    positionPopover(host, pop);
+    return;
+  }
+  add(`P(AI) ${pct}%`);
+  add(`${u.isAI ? 'Verdict: AI-generated' : 'Verdict: likely real'} at 0.65`, 'k');
+  if (u.contributions?.length) {
+    for (const c of u.contributions) {
+      const sign = c.bits >= 0 ? '+' : '';
+      add(`${c.name}: ${sign}${c.bits.toFixed(2)} bits`, 'bits');
+    }
+  }
+  add('Analyzed on this device. Nothing left the browser.', 'k');
+  pop.addEventListener('click', (ev) => ev.stopPropagation());
+  root.appendChild(pop);
+  openPopover = { state, el: pop, host };
+  positionPopover(host, pop);
+}
+
+/** @param {HTMLElement} host @param {HTMLElement} pop */
+function positionPopover(host, pop) {
+  const rect = paintedRect(host);
+  pop.style.left = `${rect.left + 4}px`;
+  pop.style.top = `${rect.top + 22}px`;
+}
+
+document.addEventListener(
+  'click',
+  (ev) => {
+    if (!openPopover) return;
+    const path = ev.composedPath();
+    if (path.includes(openPopover.el)) return;
+    if (openPopover.state.badge && path.includes(openPopover.state.badge)) return;
+    closePopover();
+  },
+  true,
+);
+
+/** @param {HTMLElement} host */
+function paintedRect(host) {
+  const box = host.getBoundingClientRect();
+  if (!(host instanceof HTMLImageElement) || !host.naturalWidth || !host.naturalHeight) {
+    return box;
+  }
+  const style = getComputedStyle(host);
+  return fittedImageRect({
+    box,
+    naturalWidth: host.naturalWidth,
+    naturalHeight: host.naturalHeight,
+    objectFit: style.objectFit,
+    objectPosition: style.objectPosition,
+  });
+}
+
+/** @param {HTMLElement} host */
+function isVisuallyHidden(host) {
+  /** @type {HTMLElement | null} */
+  let el = host;
+  while (el) {
+    const style = getComputedStyle(el);
+    if (
+      style.display === 'none' ||
+      style.visibility !== 'visible' ||
+      style.contentVisibility === 'hidden' ||
+      Number.parseFloat(style.opacity) <= 0.01
+    ) {
+      return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+
+/**
+ * @param {HTMLElement} host
+ * @param {HTMLElement} badge
+ * @returns {boolean}
+ */
+function positionBadge(host, badge) {
+  const rect = paintedRect(host);
+  if (rect.width <= 0 || rect.height <= 0 || isVisuallyHidden(host)) {
+    badge.style.display = 'none';
+    return false;
+  }
+
+  const anchorX = rect.left + 4;
+  const anchorY = rect.top + 4;
+  const anchorInViewport =
+    anchorX >= 0 && anchorX < window.innerWidth && anchorY >= 0 && anchorY < window.innerHeight;
+  const overlayHost = overlayRoot?.host;
+  /** @type {unknown[]} */
+  const overlayNodes = [badge];
+  if (setupNotice) overlayNodes.push(setupNotice);
+  if (openPopover?.el) overlayNodes.push(openPopover.el);
+  if (
+    !anchorInViewport ||
+    !overlayHost ||
+    !isHostTopmostAtPoint(host, document.elementsFromPoint(anchorX, anchorY), overlayHost, overlayNodes)
+  ) {
+    // The overlay intentionally sits above page UI. Hide its badge when the
+    // labelled image has scrolled underneath a sticky header (or another page
+    // control), otherwise the badge appears to float on the fixed chrome.
+    badge.style.display = 'none';
+    return false;
+  }
   badge.style.display = '';
-  badge.style.left = `${rect.left + window.scrollX + 4}px`;
-  badge.style.top = `${rect.top + window.scrollY + 4}px`;
+  // Keep the overlay in the same viewport coordinate space as the DOMRect.
+  // Adding window.scrollX/Y here makes the badge drift in nested scrollers
+  // such as TikTok's media viewer, where the modal moves but the page does not.
+  badge.style.left = `${rect.left + 4}px`;
+  badge.style.top = `${rect.top + 4}px`;
 
   // Dev builds report the first badge placement once, so "created but
   // invisible" is distinguishable from "never created" without DevTools
@@ -163,33 +546,92 @@ function positionBadge(img, badge) {
       }),
     );
   }
+  return true;
 }
 
 let repositionScheduled = false;
+let collisionReconcileScheduled = false;
+
+function scheduleBadgeCollisionReconcile() {
+  if (collisionReconcileScheduled) return;
+  collisionReconcileScheduled = true;
+  requestAnimationFrame(() => {
+    collisionReconcileScheduled = false;
+    reconcileBadgeCollisions();
+  });
+}
+
+/**
+ * Image viewers can paint the same visual through a thumbnail, a full-size
+ * <img>, and a wrapper background. Keep exactly one overlay per painted area,
+ * preferring a settled verdict and then a real <img> over a fallback wrapper.
+ */
+function reconcileBadgeCollisions() {
+  /** @type {RenderedBadge[]} */
+  const rendered = [];
+  for (const [id, host] of byId) {
+    const state = states.get(host);
+    const badge = state?.badge;
+    if (!state || !badge?.isConnected || badge.style.display === 'none') continue;
+    badge.style.visibility = '';
+    rendered.push({
+      id,
+      phase: state.phase,
+      url: state.url,
+      isImage: host instanceof HTMLImageElement,
+      host: paintedRect(host),
+      badge: badge.getBoundingClientRect(),
+      element: badge,
+    });
+  }
+
+  /** @param {RenderedBadge} item */
+  const priority = (item) =>
+    (item.phase === 'scored' ? 4 : item.phase === 'no-model' ? 3 : 1) +
+    (item.isImage ? 1 : 0);
+  rendered.sort((a, b) => priority(b) - priority(a));
+  /** @type {RenderedBadge[]} */
+  const keepers = [];
+  for (const item of rendered) {
+    if (keepers.some((keeper) => shouldSuppressDuplicateBadge(item, keeper))) {
+      item.element.style.visibility = 'hidden';
+    } else {
+      keepers.push(item);
+    }
+  }
+}
+
 function repositionAll() {
   if (repositionScheduled) return;
   repositionScheduled = true;
   requestAnimationFrame(() => {
     repositionScheduled = false;
-    for (const [id, img] of byId) {
-      const state = states.get(img);
+    for (const [id, el] of byId) {
+      const state = states.get(el);
       if (state?.badge) {
-        if (!img.isConnected) sweepOne(id, img);
-        else positionBadge(img, state.badge);
+        if (!el.isConnected) sweepOne(id, el);
+        else if (!positionBadge(el, state.badge) && openPopover?.state === state) closePopover();
       }
     }
+    if (openPopover) {
+      if (!openPopover.host.isConnected) closePopover();
+      else positionPopover(openPopover.host, openPopover.el);
+    }
+    scheduleBadgeCollisionReconcile();
   });
 }
 // capture:true catches scrolls of nested containers, not just the page.
 window.addEventListener('scroll', repositionAll, { capture: true, passive: true });
 window.addEventListener('resize', repositionAll, { passive: true });
 
-/** @param {string} id @param {HTMLImageElement} img */
-function sweepOne(id, img) {
-  const state = states.get(img);
+/** @param {string} id @param {HTMLElement} el */
+function sweepOne(id, el) {
+  const state = states.get(el);
+  if (openPopover?.state === state) closePopover();
   state?.badge?.remove();
-  if (state) state.badge = null;
+  states.delete(el);
   byId.delete(id);
+  scheduleBadgeCollisionReconcile();
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +650,37 @@ function ensurePort() {
     // with an open port navigates into the back/forward cache.
     void chrome.runtime.lastError;
     port = null;
+    // Anything the dead worker was holding is gone with it. An inFlight entry
+    // means "a request is already out for this URL" — after a disconnect that
+    // is false for every entry, and leaving them in place makes the re-request
+    // below short-circuit as a duplicate and never send, stranding every
+    // in-flight image in `pending` for the life of the page. That is the exact
+    // failure this reconnect exists to prevent. Covered by url-registry.test.js.
+    registry.reset();
     // SW died or extension reloaded: re-request everything still pending.
+    // no-model images are not pending — the latch converted them — so also
+    // probe whether weights are usable now. Covered by model-gate.test.js.
     setTimeout(() => {
-      for (const [, img] of byId) {
-        const s = states.get(img);
-        if (s && s.phase === 'pending') requestScan(img, s);
-      }
+      void probeModelReadiness().then((status) => {
+        if (status === 'recovered') return;
+        /** @type {HTMLElement | null} */
+        let probeEl = null;
+        /** @type {ImgState | null} */
+        let probeState = null;
+        for (const [, el] of byId) {
+          const s = states.get(el);
+          if (!s) continue;
+          if (s.phase === 'pending') requestScan(el, s);
+          else if (status === 'unavailable' && s.phase === 'no-model' && !probeEl) {
+            probeEl = el;
+            probeState = s;
+          }
+        }
+        if (probeEl && probeState && modelGate.allowProbe()) {
+          probeState.phase = 'pending';
+          requestScan(probeEl, probeState);
+        }
+      });
     }, 250);
   });
   return port;
@@ -227,28 +694,31 @@ window.addEventListener('pagehide', () => {
   port = null;
 });
 
-/** @param {HTMLImageElement} img @param {ImgState} state */
-function requestScan(img, state) {
-  const cached = urlCache.get(state.url);
+/** @param {HTMLElement} el @param {ImgState} state */
+function requestScan(el, state) {
+  const cached = registry.get(state.url);
   if (cached) {
-    applyUpdate(img, state, cached);
+    applyUpdate(el, state, cached);
     return;
   }
-  let waiters = pendingByUrl.get(state.url);
-  const alreadyInFlight = Boolean(waiters);
-  if (!waiters) {
-    waiters = new Set();
-    pendingByUrl.set(state.url, waiters);
+  if (modelGate.unavailable) {
+    state.phase = 'no-model';
+    renderBadge(el, state);
+    return;
   }
-  waiters.add(state.id);
-  if (alreadyInFlight) return; // one request per URL; all waiters share it
+  // One request per URL; every other image on that URL rides along.
+  if (!registry.join(state.url, state.id)) return;
+
+  const rect = el.getBoundingClientRect();
+  const width = el instanceof HTMLImageElement && el.naturalWidth ? el.naturalWidth : Math.round(rect.width);
+  const height = el instanceof HTMLImageElement && el.naturalHeight ? el.naturalHeight : Math.round(rect.height);
 
   ensurePort().postMessage({
     type: MSG.SCAN_REQUEST,
     id: state.id,
     url: state.url,
-    width: img.naturalWidth,
-    height: img.naturalHeight,
+    width,
+    height,
   });
 }
 
@@ -256,81 +726,244 @@ function requestScan(img, state) {
 function onScanUpdate(msg) {
   if (msg.type !== MSG.SCAN_UPDATE) return;
   const img = byId.get(msg.id);
-  if (!img) return;
-  const state = states.get(img);
-  if (!state) return;
+  const state = img ? states.get(img) : undefined;
+  // Prefer the echoed URL: the requesting node is often already gone on
+  // infinite-scroll feeds, but other waiters on the same URL are not.
+  const url = msg.url ?? state?.url ?? registry.urlForWaiter(msg.id);
+  if (!url) return;
 
-  if (msg.state === 'scored') urlCache.set(state.url, msg);
+  if (msg.state === 'no-model' && modelGate.provenUsable) {
+    retryStaleNoModel(url, msg.id);
+    return;
+  }
+  if (msg.state === 'no-model') enterModelUnavailableState();
 
-  // Deliver to every image waiting on this URL, not just the requester.
-  const waiters = pendingByUrl.get(state.url) ?? new Set([msg.id]);
-  pendingByUrl.delete(state.url);
-  for (const id of waiters) {
+  if (msg.state === 'scored') registry.remember(url, msg);
+
+  for (const id of registry.settle(url, msg.id)) {
     const el = byId.get(id);
     const s = el && states.get(el);
     if (el && s) applyUpdate(el, s, msg);
   }
 }
 
-/** @param {HTMLImageElement} img @param {ImgState} state @param {ScanUpdate} update */
-function applyUpdate(img, state, update) {
+/** @param {HTMLElement} el @param {ImgState} state @param {ScanUpdate} update */
+function applyUpdate(el, state, update) {
   state.phase = update.state;
   state.update = { ...update, id: state.id };
-  renderBadge(img, state);
+  if (update.state === 'no-model') enterModelUnavailableState();
+  else if (update.state === 'scored') onModelBecameUsable();
+  if (DEV_BUILD && update.state === 'unscannable') {
+    console.warn('[ai-image-detector] image could not be analyzed:', update.error, state.url);
+  }
+  renderBadge(el, state);
 }
 
 // ---------------------------------------------------------------------------
 // Candidate discovery
 
-/** @param {HTMLImageElement} img */
+/**
+ * Attempt to turn a visible DOM image into a scan job.
+ * @param {HTMLImageElement} img
+ * @returns {boolean} true once this exact source is handled and may be unobserved
+ */
 function considerImage(img) {
-  if (!enabled) return;
+  if (!enabled) return false;
   let state = states.get(img);
-  const url = img.currentSrc || img.src;
+  let url = img.currentSrc || img.src;
 
-  if (state && state.url === url) return; // already handled this exact source
+  // blob: URLs are document-scoped; the offscreen host cannot fetch them.
+  // Resolve in this page (the only context that can) and scan the data URL.
+  if (url.startsWith('blob:')) {
+    const cachedBlob = blobResolved.get(img);
+    if (cachedBlob && cachedBlob.src === url) {
+      url = cachedBlob.dataUrl;
+    } else {
+      if (!blobInFlight.has(img)) {
+        blobInFlight.add(img);
+        void resolveBlobUrl(img, url);
+      }
+      return false;
+    }
+  }
+
+  if (state && state.url === url && state.epoch === epoch && state.phase !== 'no-model') {
+    return true; // already handled this exact source in this epoch
+  }
   if (state) {
-    // src/srcset changed (lazy-load swap): reset and rescan.
+    // src/srcset changed, epoch advanced (re-enable / model ready), or a
+    // previous no-model result should be retried now that weights exist.
     state.badge?.remove();
     byId.delete(state.id);
   }
 
-  if (!url || !/^(https?:|data:)/.test(url)) return;
+  const rect = paintedRect(img);
+  const candidate = classifyImageCandidate({
+    url,
+    complete: img.complete,
+    naturalWidth: img.naturalWidth,
+    naturalHeight: img.naturalHeight,
+    displayedWidth: rect.width,
+    displayedHeight: rect.height,
+    minEdge: MIN_IMAGE_EDGE,
+  });
 
-  if (!img.complete || img.naturalWidth === 0) {
-    img.addEventListener('load', () => considerImage(img), { once: true });
-    return;
+  // Lazy image components commonly intersect before assigning src/srcset.
+  // Keep observing them: a later source mutation resets the observation and
+  // gives the now-usable image a fresh intersection callback.
+  if (candidate === 'wait-source') return false;
+
+  if (candidate === 'wait-load') {
+    if (!waitingForLoad.has(img)) {
+      waitingForLoad.add(img);
+      img.addEventListener(
+        'load',
+        () => {
+          waitingForLoad.delete(img);
+          if (considerImage(img)) io.unobserve(img);
+        },
+        { once: true },
+      );
+    }
+    return false;
   }
-  // Judge on the larger of natural and displayed size: an upscaled small file
-  // is still a real image on the page, and that is what the user sees.
-  const rect = img.getBoundingClientRect();
-  const naturalEdge = Math.min(img.naturalWidth, img.naturalHeight);
-  const displayedEdge = Math.min(rect.width, rect.height);
-  if (Math.max(naturalEdge, displayedEdge) < MIN_IMAGE_EDGE) {
-    states.set(img, { id: '', url, phase: 'skipped', badge: null, update: null });
-    return;
+  if (candidate === 'skip') {
+    states.set(img, { id: '', url, phase: 'skipped', badge: null, update: null, epoch });
+    return true;
   }
 
+  return beginScan(img, url);
+}
+
+/**
+ * Keep a no-model image in `byId` so MODEL_READY / a later scored update can
+ * retry it. Returning true without state unobserves the node forever if the
+ * ready broadcast was already missed.
+ * @param {HTMLElement} el
+ * @param {string} url
+ */
+function beginScan(el, url) {
   const id = `${pageId}:${++seq}`;
-  state = { id, url, phase: 'pending', badge: null, update: null };
-  states.set(img, state);
-  byId.set(id, img);
-  renderBadge(img, state);
-  requestScan(img, state);
+  /** @type {ImgState} */
+  const state = {
+    id,
+    url,
+    phase: modelGate.unavailable ? 'no-model' : 'pending',
+    badge: null,
+    update: null,
+    epoch,
+  };
+  states.set(el, state);
+  byId.set(id, el);
+  renderBadge(el, state);
+  requestScan(el, state);
+  return true;
+}
+
+/**
+ * @param {HTMLImageElement} img
+ * @param {string} blobUrl
+ */
+async function resolveBlobUrl(img, blobUrl) {
+  try {
+    const res = await fetch(blobUrl);
+    const blob = await res.blob();
+    if (blob.size > MAX_INLINE_SCAN_BYTES) {
+      throw new Error(`blob too large to inline: ${blob.size} bytes`);
+    }
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(/** @type {string} */ (reader.result));
+      reader.onerror = () => reject(reader.error ?? new Error('FileReader failed'));
+      reader.readAsDataURL(blob);
+    });
+    blobResolved.set(img, { src: blobUrl, dataUrl });
+    if (considerImage(img)) io.unobserve(img);
+  } catch (err) {
+    if (DEV_BUILD) console.warn('[ai-image-detector] blob: image not scannable:', err);
+    states.set(img, { id: '', url: blobUrl, phase: 'skipped', badge: null, update: null, epoch });
+    io.unobserve(img);
+  } finally {
+    blobInFlight.delete(img);
+  }
+}
+
+/**
+ * CSS background-image candidate. Painted size only — there is no naturalWidth.
+ * @param {HTMLElement} el
+ * @returns {boolean}
+ */
+function considerBackground(el) {
+  if (!enabled) return false;
+  const urls = cssBackgroundUrls(getComputedStyle(el).backgroundImage);
+  const url = urls.find((u) => /^(https?:|data:)/.test(u));
+  if (!url) return true; // not a content image; stop watching
+
+  let state = states.get(el);
+  if (state && state.url === url && state.epoch === epoch && state.phase !== 'no-model') {
+    return true;
+  }
+  if (state) {
+    state.badge?.remove();
+    byId.delete(state.id);
+  }
+
+  const rect = el.getBoundingClientRect();
+  const candidate = classifyPaintedCandidate({
+    url,
+    displayedWidth: rect.width,
+    displayedHeight: rect.height,
+    minEdge: MIN_IMAGE_EDGE,
+  });
+  if (candidate === 'wait-source') return false;
+  if (candidate === 'skip') {
+    states.set(el, { id: '', url, phase: 'skipped', badge: null, update: null, epoch });
+    return true;
+  }
+
+  return beginScan(el, url);
+}
+
+/** @param {Element} el */
+function considerTarget(el) {
+  if (el instanceof HTMLImageElement) return considerImage(el);
+  if (el instanceof HTMLElement) return considerBackground(el);
+  return true;
 }
 
 // Viewport-first: scanning is triggered ONLY from intersection callbacks.
 const io = new IntersectionObserver(
   (entries) => {
     for (const entry of entries) {
-      if (entry.isIntersecting) {
-        considerImage(/** @type {HTMLImageElement} */ (entry.target));
-        io.unobserve(entry.target);
+      if (entry.isIntersecting && entry.target instanceof Element) {
+        if (considerTarget(entry.target)) io.unobserve(entry.target);
       }
     }
   },
   { rootMargin: `${VIEWPORT_MARGIN}px` },
 );
+
+/** @param {ParentNode} root @param {(el: Element) => void} visit */
+function walkTree(root, visit) {
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node) continue;
+    if (node instanceof HTMLImageElement) {
+      visit(node);
+      if (node.shadowRoot) stack.push(node.shadowRoot);
+      continue;
+    }
+    if (node instanceof Element) {
+      visit(node);
+      if (node.shadowRoot) stack.push(node.shadowRoot);
+      for (let i = 0; i < node.children.length; i += 1) {
+        const child = node.children[i];
+        if (child) stack.push(child);
+      }
+    }
+  }
+}
 
 /** @param {ParentNode} root */
 function observeImages(root) {
@@ -338,7 +971,16 @@ function observeImages(root) {
     io.observe(root);
     return;
   }
-  for (const img of root.querySelectorAll('img')) io.observe(img);
+  if (root instanceof Element) {
+    walkTree(root, (el) => {
+      if (el instanceof HTMLImageElement) io.observe(el);
+      else if (el instanceof HTMLElement && isBackgroundWatchTag(el.tagName)) io.observe(el);
+    });
+    return;
+  }
+  if ('querySelectorAll' in root) {
+    for (const img of root.querySelectorAll('img')) io.observe(img);
+  }
 }
 
 const mo = new MutationObserver((records) => {
@@ -348,31 +990,36 @@ const mo = new MutationObserver((records) => {
       if (node instanceof Element) observeImages(node);
     }
     if (rec.removedNodes.length > 0) removed = true;
-    if (
-      rec.type === 'attributes' &&
-      rec.target instanceof HTMLImageElement &&
-      states.has(rec.target)
-    ) {
-      io.observe(rec.target); // re-evaluate on next intersection
+    if (rec.type === 'attributes' && rec.target instanceof Element) {
+      // Re-observing an already observed element is a no-op. Reset it so an
+      // intersecting lazy image whose first callback had no usable URL gets a
+      // new callback for the assigned source — and so a CSS class swap that
+      // paints a background image is not missed.
+      resetImageObservation(io, rec.target);
     }
   }
   if (removed) {
-    for (const [id, img] of byId) {
-      if (!img.isConnected) sweepOne(id, img);
+    for (const [id, el] of byId) {
+      if (!el.isConnected) sweepOne(id, el);
     }
   }
+  // Menus such as Google Search autocomplete cover the feed by inserting or
+  // restyling page elements without scrolling. Re-run the same hit test used
+  // for sticky headers so badges underneath a newly opened overlay disappear
+  // immediately (and return when it closes).
+  repositionAll();
 });
 
 // ---------------------------------------------------------------------------
 // Boot / teardown
 
 function boot() {
-  observeImages(document);
+  observeImages(document.documentElement);
   mo.observe(document.documentElement, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['src', 'srcset'],
+    attributeFilter: ['src', 'srcset', 'style', 'class'],
   });
   // One line, page console, so "is the scanner even running here?" is a
   // two-second question. Nothing sensitive is ever logged.
@@ -398,26 +1045,47 @@ function startHud() {
     let queued = 0;
     let scored = 0;
     let skipped = 0;
-    for (const img of document.images) {
-      const s = states.get(img);
+    let failed = 0;
+    let setup = 0;
+    for (const [, el] of byId) {
+      const s = states.get(el);
       if (!s) continue;
       if (s.phase === 'skipped') skipped++;
       else if (s.phase === 'scored') scored++;
       else if (s.phase === 'pending') queued++;
+      else if (s.phase === 'unscannable') failed++;
+      else if (s.phase === 'no-model') setup++;
     }
-    hud.textContent = `AID dev · ${imgs} img · ${scored} scored · ${queued} pending · ${skipped} too-small`;
+    hud.textContent =
+      `AID dev · ${imgs} img · ${byId.size} tracked · ${scored} scored · ${queued} pending · ` +
+      `${failed} failed · ${setup} setup · ${skipped} too-small`;
   };
   tick();
   setInterval(tick, 500);
 }
 
 function teardown() {
+  epoch += 1;
+  modelGate.reset();
+  staleNoModelRetried.clear();
+  clearSetupNotice();
+  closePopover();
   io.disconnect();
   mo.disconnect();
-  for (const [id, img] of byId) sweepOne(id, img);
+  for (const [id, el] of byId) sweepOne(id, el);
   byId.clear();
-  pendingByUrl.clear();
+  registry.reset();
 }
+
+function rescanVisible() {
+  epoch += 1;
+  observeImages(document.documentElement);
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type !== MSG.MODEL_READY) return;
+  applyModelReady();
+});
 
 chrome.storage.local
   .get(ENABLED_FLAG)
