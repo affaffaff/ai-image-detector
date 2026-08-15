@@ -38,3 +38,6 @@ Thumbs.db
 .cursor/
 
 /gallery/
+
+/models/weights/*
+!/models/weights/export-metadata.json
