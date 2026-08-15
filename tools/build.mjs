@@ -48,6 +48,14 @@ if (localModelIndex >= 0 && !LOCAL_MODEL) {
   throw new Error('--model requires a path to an exported ONNX file');
 }
 
+// Plain `npm run build` is the release path: it bundles the pinned weights
+// when they are present (they are committed), so the documented command
+// reproduces the shipped dist instead of deleting its model. --model remains
+// an explicit override for pre-publication parity checks.
+const localModelName = 'community-forensics-384-int8.onnx';
+const DEFAULT_MODEL = join(ROOT, 'models', 'weights', localModelName);
+const BUNDLED_MODEL = LOCAL_MODEL ?? (existsSync(DEFAULT_MODEL) ? DEFAULT_MODEL : null);
+
 assertShippingContract({ root: ROOT, localTest: Boolean(LOCAL_MODEL) });
 
 rmSync(DIST, { recursive: true, force: true });
@@ -106,10 +114,9 @@ const copies = [
 for (const name of ['icon16.png', 'icon48.png', 'icon128.png']) {
   copies.push([join(SRC, 'icons', name), join(DIST, 'icons', name)]);
 }
-const localModelName = 'community-forensics-384-int8.onnx';
-if (LOCAL_MODEL) {
-  if (!existsSync(LOCAL_MODEL)) throw new Error(`local model not found: ${LOCAL_MODEL}`);
-  copies.push([LOCAL_MODEL, join(DIST, 'models', localModelName)]);
+if (BUNDLED_MODEL) {
+  if (!existsSync(BUNDLED_MODEL)) throw new Error(`local model not found: ${BUNDLED_MODEL}`);
+  copies.push([BUNDLED_MODEL, join(DIST, 'models', localModelName)]);
 }
 // Explicit production allowlist. Diagnostic/experimental curves (especially
 // center-crop evidence) must never hitch a ride in the package.
@@ -125,28 +132,44 @@ for (const [from, to] of copies) {
   cpSync(from, to);
 }
 
-// Dev builds are labeled in the extension list and popup title.
-if (DEV || LOCAL_MODEL) {
+// Dev builds are labeled in the extension list and popup title so a dev build
+// can never be mistaken for the real one. Bundled weights are the normal
+// release path and do NOT rename the extension.
+if (DEV) {
   const path = join(DIST, 'manifest.json');
   const m = JSON.parse(readFileSync(path, 'utf8'));
-  m.name = DEV ? `${m.name} (DEV — simulated scores)` : `${m.name} (Local Model)`;
+  m.name = `${m.name} (DEV — simulated scores)`;
   writeFileSync(path, JSON.stringify(m, null, 2) + '\n');
 }
 
-// A local-model build exists only for browser parity verification before the
-// exported artifact is publicly hosted. The ordinary release build never
-// bundles weights and continues to use the automatic setup download flow.
-if (LOCAL_MODEL) {
+// A bundled build points the dist model manifest at the packed artifact. The
+// pinned digest is ASSERTED, never re-pinned: if the bytes on disk do not
+// match models/manifest.json, the build fails instead of self-certifying
+// whatever file it was handed (a re-pin would make the runtime SHA-256 check
+// in download.js meaningless as a supply-chain claim).
+if (BUNDLED_MODEL) {
   const modelPath = join(DIST, 'models', localModelName);
   const bytes = readFileSync(modelPath);
   const manifestPath = join(DIST, 'models', 'manifest.json');
   const modelManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const primary = modelManifest.models?.[0];
   if (!primary) throw new Error('models/manifest.json has no primary model entry');
+  const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+  if (!primary.sha256 || !primary.bytes) {
+    throw new Error('models/manifest.json must pin sha256 and bytes before a model can be bundled');
+  }
+  if (primary.sha256 !== actualSha256) {
+    throw new Error(
+      `bundled model SHA-256 mismatch: manifest pins ${primary.sha256}, file is ${actualSha256}`,
+    );
+  }
+  if (primary.bytes !== bytes.byteLength) {
+    throw new Error(
+      `bundled model size mismatch: manifest pins ${primary.bytes} bytes, file is ${bytes.byteLength}`,
+    );
+  }
   primary.url = null;
   primary.bundledPath = `models/${localModelName}`;
-  primary.bytes = bytes.byteLength;
-  primary.sha256 = createHash('sha256').update(bytes).digest('hex');
   writeFileSync(manifestPath, JSON.stringify(modelManifest, null, 2) + '\n');
 }
 
@@ -196,5 +219,6 @@ assertShippingContract({ root: ROOT, dist: DIST, localTest: Boolean(LOCAL_MODEL)
 
 console.log(
   `built dist/ [${DEV ? 'DEV — mock engine on by default' : 'RELEASE'}] — ` +
-    `${bundles.length} bundles, ${copies.length} assets, manifest check ok`,
+    `${bundles.length} bundles, ${copies.length} assets, ` +
+    `model ${BUNDLED_MODEL ? 'bundled (hash-verified against manifest pin)' : 'NOT bundled — setup download required'}, manifest check ok`,
 );
