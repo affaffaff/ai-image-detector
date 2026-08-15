@@ -263,6 +263,13 @@ frozen B1-B5 permutation battery fails, and its codec null reaches 0.8889 BA
 against the detector's 0.8651. See
 [`docs/NUISANCE_BATTERY_REPORT.md`](docs/NUISANCE_BATTERY_REPORT.md).
 
+Delivery-path robustness under the
+[c143-survey protocol](https://github.com/agentatwork/c143-survey/blob/main/PROTOCOL.md)
+(eleven fixed Pillow pipelines, fixed 0.65, sealed headline above unchanged):
+11/11 pipelines clear 75.0%, worst row 89.2% (95% CI [86.3, 92.0]) — corpus
+composition, per-class numbers, and caveats in
+[`docs/PROTOCOL_SWEEP.md`](docs/PROTOCOL_SWEEP.md).
+
 The local evidence workspace retains the scored rows and acceptance report at
 `data/matched/browser-scores-all.csv` and
 `data/matched/gated-eval-all.json`. Dataset images and score arrays are
