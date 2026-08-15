@@ -8,9 +8,6 @@
 # Dependencies
 /node_modules/
 
-# Source model weights are downloaded at setup and hash-verified against
-# models/manifest.json (which IS committed). Weight binaries never enter git.
-/models/weights/
 *.onnx
 
 # dist/ IS committed so people can load the extension in Chrome directly.
@@ -39,5 +36,7 @@ Thumbs.db
 
 /gallery/
 
+# Source model weights are downloaded at setup and hash-verified
 /models/weights/*
+# Keep metadata tracked
 !/models/weights/export-metadata.json

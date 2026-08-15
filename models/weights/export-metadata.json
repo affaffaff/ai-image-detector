@@ -1,0 +1,49 @@
+{
+  "artifacts": {
+    "fp32": {
+      "bytes": 87357077,
+      "file": "community-forensics-384-fp32.onnx",
+      "sha256": "a74c02577b5f905be482f4ea6abdbd8f0889c258ecce1e99e0176913bd97c461"
+    },
+    "int8": {
+      "bytes": 23967155,
+      "file": "community-forensics-384-int8.onnx",
+      "sha256": "df1aade56566b892178154793bfa95cf5808339d77593ec8137e7c5e306f2035"
+    }
+  },
+  "baseModel": {
+    "id": "vit_small_patch16_384.augreg_in21k_ft_in1k",
+    "license": "Apache-2.0"
+  },
+  "formatVersion": 1,
+  "io": {
+    "input": {
+      "name": "pixel_values",
+      "shape": [
+        1,
+        3,
+        384,
+        384
+      ]
+    },
+    "output": {
+      "name": "fake_logit",
+      "semantic": "fake-logit"
+    }
+  },
+  "parity": {
+    "fp32AbsError": 1.0728836059570312e-05,
+    "fp32Logit": -1.2487095594406128,
+    "int8AbsError": 0.3502568006515503,
+    "int8Logit": -1.598966360092163,
+    "pytorchLogit": -1.2486988306045532
+  },
+  "source": {
+    "file": "model_v11_ViT_384_base_ckpt.pt",
+    "kind": "official-dropbox-pytorch",
+    "license": "MIT",
+    "repo": "OwensLab/commfor-model-384",
+    "revision": "87b013b3d134dea22518e743bd7a1901e52fe9da",
+    "sha256": "d134f6f2c6185c9146ed54e7ea1c43e9f67ea42d98e9bdc88791d4163095dcde"
+  }
+}
