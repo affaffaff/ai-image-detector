@@ -37,6 +37,10 @@ Thumbs.db
 /gallery/
 
 # Source model weights are downloaded at setup and hash-verified
+# The pinned INT8 shipping artifact IS committed — git already stores the same
+# blob via dist/, so tracking it here costs zero bytes and lets a fresh clone
+# run the bundling build. The FP32 export stays local-only forever.
 /models/weights/*
 # Keep metadata tracked
 !/models/weights/export-metadata.json
+!/models/weights/community-forensics-384-int8.onnx
